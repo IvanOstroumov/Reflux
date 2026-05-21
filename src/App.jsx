@@ -39,12 +39,20 @@ export default function App() {
   const lastFramesRef = useRef(0)
   const lastBytesRef = useRef(0)
 
-  // ─── Boot: load sources ───────────────────────────────────────────────────
+  // ─── Source list ──────────────────────────────────────────────────────────
+  // Fetched once on mount, then re-polled every 3 s while the picker is open
+  // so newly launched windows appear without the user having to reopen it.
   useEffect(() => {
-    invoke('list_capture_sources')
-      .then(src => { if (src?.length) setSources(src) })
-      .catch(e => console.warn('list_capture_sources:', e))
-  }, [])
+    const refresh = () =>
+      invoke('list_capture_sources')
+        .then(src => { if (src?.length) setSources(src) })
+        .catch(e => console.warn('list_capture_sources:', e))
+
+    refresh()
+    if (!showSourcePicker) return
+    const id = setInterval(refresh, 3000)
+    return () => clearInterval(id)
+  }, [showSourcePicker])
 
   // ─── Keyboard shortcuts ───────────────────────────────────────────────────
   useEffect(() => {
@@ -94,7 +102,9 @@ export default function App() {
     return () => {
       unlistenRefs.current.forEach(fn => typeof fn === 'function' && fn())
     }
-  }, [mode])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []) // ← mount-once: re-registering on mode change drops events emitted
+         //   during the async listen() gap, causing the black-screen bug.
 
   // Also wire stub listeners for browser dev mode
   useEffect(() => {

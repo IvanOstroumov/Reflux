@@ -15,7 +15,6 @@
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 use tokio::sync::{mpsc, oneshot};
 
 /// Messages exchanged over the signaling channel.
@@ -41,15 +40,15 @@ pub struct SignalingPeer {
 }
 
 /// Start a host-side signaling listener.
-/// Returns the invite token and a future that resolves once a viewer connects.
+/// Binds to an OS-assigned port so repeated sessions never collide.
+/// Returns `(token, actual_port, peer_ready_rx)`.
 pub async fn start_host_signaling(
-    port: u16,
-) -> Result<(String, oneshot::Receiver<Result<SignalingPeer>>)> {
+) -> Result<(String, u16, oneshot::Receiver<Result<SignalingPeer>>)> {
     use tokio::net::TcpListener;
 
-    let addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
-    let listener = TcpListener::bind(addr).await
-        .map_err(|e| anyhow!("Failed to bind signaling port {port}: {e}"))?;
+    let listener = TcpListener::bind("0.0.0.0:0").await
+        .map_err(|e| anyhow!("Failed to bind signaling port: {e}"))?;
+    let actual_port = listener.local_addr()?.port();
 
     // Generate a random 8-char alphanumeric token (no ambiguous chars), per PRD §5.5
     let token = generate_token(8);
@@ -71,7 +70,7 @@ pub async fn start_host_signaling(
         }
     });
 
-    Ok((token, peer_rx))
+    Ok((token, actual_port, peer_rx))
 }
 
 /// Connect to a host's signaling server as a viewer.

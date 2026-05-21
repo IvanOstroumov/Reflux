@@ -95,10 +95,9 @@ async fn start_host_session(
     // Start audio capture
     let audio_rx = audio::start_audio_capture().await.map_err(|e| e.to_string())?;
 
-    // Start signaling server on a random port
-    let signal_port: u16 = 9001;
-    let (token, peer_ready_rx) =
-        signaling::start_host_signaling(signal_port).await.map_err(|e| e.to_string())?;
+    // Start signaling server on an OS-assigned port (avoids EADDRINUSE on retry)
+    let (token, signal_port, peer_ready_rx) =
+        signaling::start_host_signaling().await.map_err(|e| e.to_string())?;
 
     // Encode the invite: include local IP + port + token
     let local_ip = get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
