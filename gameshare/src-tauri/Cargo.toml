@@ -1,0 +1,98 @@
+[package]
+name = "gameshare"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and descriptions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "gameshare_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "gameshare"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+thiserror = "1"
+once_cell = "1"
+
+# WebRTC - peer-to-peer transport
+webrtc = "0.11"
+
+# Zero-copy byte buffers (used by the WebRTC sample/RTP path)
+bytes = "1"
+
+# STUN/ICE helpers (used by webrtc crate internally, but listed for clarity)
+# webrtc already pulls in stun, turn, ice
+
+# UUID for session tokens  
+uuid = { version = "1", features = ["v4"] }
+
+# Random number generation
+rand = "0.8"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# HTTP client for signaling
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Async channels
+tokio-stream = "0.1"
+futures = "0.3"
+
+# Base64 for token encoding
+base64 = "0.22"
+
+# Windows-specific dependencies (only compiled on Windows)
+[target.'cfg(target_os = "windows")'.dependencies]
+# Opus audio codec (links libopus — only needed for real WASAPI capture on Windows)
+audiopus = "0.3"
+# Windows Graphics Capture + DXGI Desktop Duplication
+windows = { version = "0.58", features = [
+    # Core
+    "Win32_Foundation",
+    "Win32_System_WinRT",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    # DXGI and Direct3D 11
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D",
+    # Windows Graphics Capture (WGC)
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    # WASAPI audio
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Media_KernelStreaming",
+    "Win32_System_Variant",
+    # Encoder / Media Foundation  
+    "Win32_Media_MediaFoundation",
+    # Window enumeration
+    "Win32_UI_WindowsAndMessaging",
+    # System info
+    "Win32_System_SystemInformation",
+    "Win32_System_Performance",
+] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true
