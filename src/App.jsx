@@ -34,7 +34,6 @@ export default function App() {
   const canvasRef = useRef(null)
   const videoStreamRef = useRef(null)
   const audioStreamRef = useRef(null)
-  const unlistenRefs = useRef([])
   const statsTimerRef = useRef(null)
   const lastFramesRef = useRef(0)
   const lastBytesRef = useRef(0)
@@ -67,15 +66,20 @@ export default function App() {
   }, [status])
 
   // ─── Tauri event listeners ────────────────────────────────────────────────
+  // Registered once at mount. React StrictMode (dev) runs the effect twice
+  // (mount → cleanup → remount). We use a `cancelled` flag so that if
+  // cleanup fires while setup() is still awaiting, we immediately unlisten
+  // the just-registered handlers rather than leaking them.
   useEffect(() => {
+    let cancelled = false
+    const registered = []
+
     const setup = async () => {
       // session-status: { status, invite_code? }
       const u1 = await listen('session-status', ({ payload }) => {
         setStatus(payload.status)
         if (payload.invite_code) setInviteCode(payload.invite_code)
-        if (payload.status === 'disconnected') {
-          teardownDecoder()
-        }
+        if (payload.status === 'disconnected') teardownDecoder()
       })
 
       // session-error: { message }
@@ -96,15 +100,20 @@ export default function App() {
         audioStreamRef.current?.feed(base64ToUint8Array(payload))
       })
 
-      unlistenRefs.current = [u1, u2, u3, u4]
+      if (cancelled) {
+        // Cleanup already ran (StrictMode double-mount) — immediately unlisten
+        u1(); u2(); u3(); u4()
+      } else {
+        registered.push(u1, u2, u3, u4)
+      }
     }
+
     setup()
     return () => {
-      unlistenRefs.current.forEach(fn => typeof fn === 'function' && fn())
+      cancelled = true
+      registered.forEach(fn => typeof fn === 'function' && fn())
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []) // ← mount-once: re-registering on mode change drops events emitted
-         //   during the async listen() gap, causing the black-screen bug.
+  }, [])
 
   // Also wire stub listeners for browser dev mode
   useEffect(() => {
@@ -205,25 +214,6 @@ export default function App() {
   }
 
   // ─── Host flow ────────────────────────────────────────────────────────────
-  async function handleStartHost() {
-    if (!selectedSource) {
-      setShowSourcePicker(true)
-      return
-    }
-    setError(null)
-    setMode('host')
-    try {
-      await invoke('start_host_session', {
-        sourceId: selectedSource.id,
-        fps,
-        bitrateMbps,
-      })
-    } catch (e) {
-      setError(String(e))
-      setStatus('idle')
-    }
-  }
-
   function handleSourceSelected(src) {
     setSelectedSource(src)
     setShowSourcePicker(false)
@@ -239,12 +229,20 @@ export default function App() {
   async function handleStartWithSource(src) {
     setError(null)
     setMode('host')
+    setStatus('generating_token') // show spinner immediately, don't wait for event
     try {
-      await invoke('start_host_session', {
+      const code = await invoke('start_host_session', {
         sourceId: src.id,
         fps,
         bitrateMbps,
       })
+      // Backend returned the invite code synchronously — drive state from the
+      // return value so the waiting screen shows even if the Tauri event was
+      // delivered before our listener was ready (StrictMode timing race).
+      if (code) {
+        setInviteCode(code)
+        setStatus('waiting_for_viewer')
+      }
     } catch (e) {
       setError(String(e))
       setStatus('idle')
