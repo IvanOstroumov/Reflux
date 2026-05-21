@@ -153,13 +153,29 @@ mod mf_encoder {
         Win32::System::Com::*,
     };
 
-    #[allow(dead_code)]
+    // GetEvent flag: blocking (0) vs. non-blocking (1).
+    // The parameter type in windows 0.58 is MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS.
+    const GET_EVENT_BLOCK:    MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS =
+        MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0);
+    const GET_EVENT_NO_WAIT:  MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS =
+        MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(1); // MF_EVENT_FLAG_NO_WAIT
+    // HRESULT returned when the event queue is empty (no-wait mode).
+    const MF_E_NO_EVENTS_AVAILABLE: u32 = 0xC00D_36B1;
+    // GetType() returns u32 in windows 0.58; MF_EVENT_TYPE.0 is i32 — cast to match.
+    const EVT_NEED_INPUT:     u32 = METransformNeedInput.0    as u32; // 600
+    const EVT_HAVE_OUTPUT:    u32 = METransformHaveOutput.0   as u32; // 601
+    const EVT_DRAIN_COMPLETE: u32 = METransformDrainComplete.0 as u32; // 602
+
     pub struct MfEncoder {
         transform: IMFTransform,
-        input_type: IMFMediaType,
+        /// Async event generator — hardware MFTs are always asynchronous.
+        event_gen: IMFMediaEventGenerator,
         config: EncoderConfig,
         sample_count: u64,
         mf_started: bool,
+        /// Counts buffered METransformNeedInput events not yet consumed by encode().
+        /// Avoids re-blocking when the MFT fires NeedInput early (pipeline filling).
+        pending_need_input: u32,
     }
 
     impl Drop for MfEncoder {
@@ -241,6 +257,20 @@ mod mf_encoder {
                 // Free the activate array
                 CoTaskMemFree(Some(activates as *mut _));
 
+                // ── Async unlock ────────────────────────────────────────────────
+                // Hardware MFTs are *asynchronous* COM objects.  Before calling
+                // SetOutputType / SetInputType we must set MF_TRANSFORM_ASYNC_UNLOCK
+                // on the transform's attribute store, otherwise every subsequent
+                // call returns MF_E_TRANSFORM_ASYNC_LOCKED (0xC00D6D77).
+                let mft_attrs: IMFAttributes = transform.GetAttributes()
+                    .context("IMFTransform::GetAttributes")?;
+                mft_attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)
+                    .context("MF_TRANSFORM_ASYNC_UNLOCK")?;
+
+                // Get the event generator used to drive the async encode loop.
+                let event_gen: IMFMediaEventGenerator = transform.cast()
+                    .context("IMFMediaEventGenerator — MFT does not expose async events")?;
+
                 // Configure output type (H.264)
                 let output_mt: IMFMediaType = MFCreateMediaType()?;
                 output_mt.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -255,7 +285,6 @@ mod mf_encoder {
                     pack_u32_u32(config.fps, 1),
                 )?;
                 output_mt.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-                // H.264 Baseline profile for maximum decoder compatibility
                 output_mt.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
                 transform.SetOutputType(0, &output_mt, 0)?;
 
@@ -276,16 +305,12 @@ mod mf_encoder {
 
                 // Set CBR via codec API
                 if let Ok(codec_api) = transform.cast::<ICodecAPI>() {
-                    // Rate control: CBR
                     let cbr_variant = com_variant_u32(eAVEncCommonRateControlMode_CBR.0 as u32);
                     let _ = codec_api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &cbr_variant);
-                    // No B-frames (PRD requirement)
-                    let bframes = com_variant_u32(0);
+                    let bframes = com_variant_u32(0); // no B-frames (PRD requirement)
                     let _ = codec_api.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &bframes);
-                    // Keyframe interval
                     let gop = com_variant_u32(config.fps * config.keyframe_interval_secs);
                     let _ = codec_api.SetValue(&CODECAPI_AVEncMPVGOPSize, &gop);
-                    // Low latency mode
                     let low_latency = com_variant_u32(1);
                     let _ = codec_api.SetValue(&CODECAPI_AVLowLatencyMode, &low_latency);
                 }
@@ -299,45 +324,70 @@ mod mf_encoder {
 
                 Ok((MfEncoder {
                     transform,
-                    input_type: input_mt,
+                    event_gen,
                     config,
                     sample_count: 0,
                     mf_started: true,
+                    pending_need_input: 0,
                 }, kind))
             }
         }
 
         pub fn encode(&mut self, frame: &VideoFrame) -> Result<Vec<EncodedPacket>> {
             unsafe {
-                // Convert BGRA frame to NV12 for MFT input
-                let nv12 = bgra_to_nv12(&frame.data, frame.width, frame.height);
+                let sample = self.build_sample(frame)?;
+                let mut packets = Vec::new();
 
-                // Create MF sample + buffer
-                let sample: IMFSample = MFCreateSample()?;
-                let buffer: IMFMediaBuffer =
-                    MFCreateMemoryBuffer(nv12.len() as u32)?;
+                // ── Step 1: obtain a METransformNeedInput slot ──────────────────
+                // Hardware async MFTs fire METransformNeedInput to signal they can
+                // accept input.  We may already have a buffered one from the
+                // previous frame's output-drain phase.
+                if self.pending_need_input > 0 {
+                    self.pending_need_input -= 1;
+                } else {
+                    // Block until NeedInput arrives; collect any stray output first.
+                    loop {
+                        let ev = self.event_gen.GetEvent(GET_EVENT_BLOCK)
+                            .context("GetEvent (await NeedInput)")?;
+                        match ev.GetType()? {
+                            EVT_NEED_INPUT => break,
+                            EVT_HAVE_OUTPUT => {
+                                if let Some(pkt) = self.try_process_output(0)? {
+                                    packets.push(pkt);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
 
-                let mut ptr: *mut u8 = std::ptr::null_mut();
-                let mut _max = 0u32;
-                let mut _cur = 0u32;
-                buffer.Lock(&mut ptr, Some(&mut _max), Some(&mut _cur))?;
-                std::ptr::copy_nonoverlapping(nv12.as_ptr(), ptr, nv12.len());
-                buffer.Unlock()?;
-                buffer.SetCurrentLength(nv12.len() as u32)?;
-
-                sample.AddBuffer(&buffer)?;
-
-                // PTS in 100ns units (MF time base)
-                let pts_100ns = (frame.pts_us * 10) as i64;
-                sample.SetSampleTime(pts_100ns)?;
-                let duration_100ns = 10_000_000i64 / self.config.fps as i64;
-                sample.SetSampleDuration(duration_100ns)?;
-
+                // ── Step 2: submit the frame ────────────────────────────────────
                 self.transform.ProcessInput(0, &sample, 0)?;
                 self.sample_count += 1;
 
-                // Collect output packets
-                self.collect_output(frame.pts_us)
+                // ── Step 3: non-blocking drain ──────────────────────────────────
+                // With low-latency + no-B-frames settings, HaveOutput typically
+                // follows immediately.  NeedInput events for the *next* frame are
+                // buffered so encode() can skip the blocking wait next call.
+                loop {
+                    match self.event_gen.GetEvent(GET_EVENT_NO_WAIT) {
+                        Err(e) if e.code().0 as u32 == MF_E_NO_EVENTS_AVAILABLE => break,
+                        Err(e) => return Err(anyhow!("GetEvent (drain): {e}")),
+                        Ok(ev) => match ev.GetType()? {
+                            EVT_HAVE_OUTPUT => {
+                                if let Some(pkt) = self.try_process_output(frame.pts_us)? {
+                                    packets.push(pkt);
+                                }
+                            }
+                            EVT_NEED_INPUT => {
+                                self.pending_need_input += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                Ok(packets)
             }
         }
 
@@ -346,55 +396,91 @@ mod mf_encoder {
             unsafe {
                 self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)?;
                 self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)?;
-                self.collect_output(0)
+
+                let mut packets = Vec::new();
+                loop {
+                    let ev = self.event_gen.GetEvent(GET_EVENT_BLOCK)
+                        .context("GetEvent (flush)")?;
+                    match ev.GetType()? {
+                        EVT_HAVE_OUTPUT => {
+                            if let Some(pkt) = self.try_process_output(0)? {
+                                packets.push(pkt);
+                            }
+                        }
+                        EVT_DRAIN_COMPLETE => break,
+                        _ => {}
+                    }
+                }
+                Ok(packets)
             }
         }
 
-        unsafe fn collect_output(&mut self, pts_hint: u64) -> Result<Vec<EncodedPacket>> {
-            let mut packets = Vec::new();
-            loop {
-                let output_data = MFT_OUTPUT_DATA_BUFFER {
-                    dwStreamID: 0,
-                    pSample: std::mem::ManuallyDrop::new(None),
-                    dwStatus: 0,
-                    pEvents: std::mem::ManuallyDrop::new(None),
-                };
-                let mut status = 0u32;
+        /// Build an IMFSample from a captured VideoFrame (BGRA → NV12).
+        unsafe fn build_sample(&self, frame: &VideoFrame) -> Result<IMFSample> {
+            let nv12 = bgra_to_nv12(&frame.data, frame.width, frame.height);
 
-                // ProcessOutput in windows 0.58 takes a slice of buffers (count is implicit).
-                // Use a local array so we can access buffers[0].pSample after the call
-                // (avoids a borrow-after-move issue with output_data).
-                let mut buffers = [output_data];
-                match self.transform.ProcessOutput(0, &mut buffers, &mut status) {
-                    Ok(()) => {}
-                    Err(e) if e.code().0 as u32 == 0xC00D6D72 /* MF_E_TRANSFORM_NEED_MORE_INPUT */ => break,
-                    Err(e) => return Err(anyhow!("ProcessOutput: {e}")),
+            let sample: IMFSample = MFCreateSample()?;
+            let buffer: IMFMediaBuffer = MFCreateMemoryBuffer(nv12.len() as u32)?;
+
+            let mut ptr: *mut u8 = std::ptr::null_mut();
+            let mut _max = 0u32;
+            let mut _cur = 0u32;
+            buffer.Lock(&mut ptr, Some(&mut _max), Some(&mut _cur))?;
+            std::ptr::copy_nonoverlapping(nv12.as_ptr(), ptr, nv12.len());
+            buffer.Unlock()?;
+            buffer.SetCurrentLength(nv12.len() as u32)?;
+            sample.AddBuffer(&buffer)?;
+
+            let pts_100ns = (frame.pts_us * 10) as i64;
+            sample.SetSampleTime(pts_100ns)?;
+            let duration_100ns = 10_000_000i64 / self.config.fps as i64;
+            sample.SetSampleDuration(duration_100ns)?;
+
+            Ok(sample)
+        }
+
+        /// Call ProcessOutput once and return the resulting packet (if any).
+        /// Called after a METransformHaveOutput event is received.
+        unsafe fn try_process_output(&mut self, pts_hint: u64) -> Result<Option<EncodedPacket>> {
+            let output_data = MFT_OUTPUT_DATA_BUFFER {
+                dwStreamID: 0,
+                pSample: std::mem::ManuallyDrop::new(None),
+                dwStatus: 0,
+                pEvents: std::mem::ManuallyDrop::new(None),
+            };
+            let mut buffers = [output_data];
+            let mut status = 0u32;
+
+            match self.transform.ProcessOutput(0, &mut buffers, &mut status) {
+                Ok(()) => {}
+                Err(e) if e.code().0 as u32 == 0xC00D_6D72 /* MF_E_TRANSFORM_NEED_MORE_INPUT */ => {
+                    return Ok(None);
                 }
-
-                let sample_opt = std::mem::ManuallyDrop::take(&mut buffers[0].pSample);
-                if let Some(sample) = sample_opt {
-                    let pts_us = sample.GetSampleTime().map(|t| t as u64 / 10).unwrap_or(pts_hint);
-
-                    // Read compressed bytes
-                    let buffer = sample.ConvertToContiguousBuffer()?;
-                    let mut ptr: *mut u8 = std::ptr::null_mut();
-                    let mut _max = 0u32;
-                    let mut len = 0u32;
-                    buffer.Lock(&mut ptr, Some(&mut _max), Some(&mut len))?;
-                    let data = std::slice::from_raw_parts(ptr, len as usize).to_vec();
-                    buffer.Unlock()?;
-
-                    // Check if IDR (keyframe)
-                    let is_keyframe = is_idr_nal(&data);
-
-                    packets.push(EncodedPacket {
-                        data: Arc::new(data),
-                        pts_us,
-                        is_keyframe,
-                    });
-                }
+                Err(e) => return Err(anyhow!("ProcessOutput: {e}")),
             }
-            Ok(packets)
+
+            let sample_opt = std::mem::ManuallyDrop::take(&mut buffers[0].pSample);
+            if let Some(sample) = sample_opt {
+                let pts_us = sample.GetSampleTime()
+                    .map(|t| t as u64 / 10)
+                    .unwrap_or(pts_hint);
+
+                let buffer = sample.ConvertToContiguousBuffer()?;
+                let mut ptr: *mut u8 = std::ptr::null_mut();
+                let mut _max = 0u32;
+                let mut len = 0u32;
+                buffer.Lock(&mut ptr, Some(&mut _max), Some(&mut len))?;
+                let data = std::slice::from_raw_parts(ptr, len as usize).to_vec();
+                buffer.Unlock()?;
+
+                Ok(Some(EncodedPacket {
+                    is_keyframe: is_idr_nal(&data),
+                    data: Arc::new(data),
+                    pts_us,
+                }))
+            } else {
+                Ok(None)
+            }
         }
     }
 
