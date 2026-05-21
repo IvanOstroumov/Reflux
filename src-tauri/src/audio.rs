@@ -3,7 +3,7 @@
 // PRD §5.3: 48kHz/16-bit stereo, Opus 128kbps, 20ms frames,
 //           OPUS_APPLICATION_RESTRICTED_LOWDELAY.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 

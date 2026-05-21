@@ -49,7 +49,7 @@ use windows::{
     },
     Graphics::{
         Capture::{
-            Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+            Direct3D11CaptureFramePool, GraphicsCaptureItem,
         },
         DirectX::{
             Direct3D11::{IDirect3DDevice, IDirect3DSurface},
@@ -455,7 +455,7 @@ fn dxgi_capture_loop(
 
         let _ = ready_tx.send(Ok((w, h)));
 
-        let frame_us = 1_000_000u64 / fps_limit.max(1) as u64;
+        let _frame_us = 1_000_000u64 / fps_limit.max(1) as u64;
         let timeout_ms = (1000 / fps_limit.max(1) + 5).min(50);
 
         loop {
@@ -544,7 +544,7 @@ pub fn enumerate_sources_win() -> Vec<CaptureSource> {
         };
         let mut monitor_idx = 0u32;
         let mut adapter_idx = 0u32;
-        'outer: loop {
+        loop {
             let adapter: IDXGIAdapter1 = match factory.EnumAdapters1(adapter_idx) {
                 Ok(a) => a,
                 Err(_) => break,

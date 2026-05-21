@@ -60,6 +60,7 @@ const TURN_CREDENTIAL: &str = "";
 
 /// Connection stats emitted periodically to the UI.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
 pub struct ConnectionStats {
     pub state: String,
     pub bytes_sent: u64,
@@ -157,6 +158,7 @@ impl HostSession {
 
     /// Register connection state change callback.
     /// In webrtc 0.11, on_peer_connection_state_change is a sync fn — no .await.
+    #[allow(dead_code)]
     pub fn on_connection_state_change<F>(&self, f: F)
     where
         F: Fn(RTCPeerConnectionState) + Send + Sync + 'static,
@@ -237,6 +239,7 @@ impl ViewerSession {
         self.pc.add_ice_candidate(init).await.map_err(|e| anyhow!("{e}"))
     }
 
+    #[allow(dead_code)]
     pub fn on_connection_state_change<F>(&self, f: F)
     where F: Fn(RTCPeerConnectionState) + Send + Sync + 'static
     {

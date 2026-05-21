@@ -16,24 +16,20 @@ use unsafe_libopus::{
     varargs, OPUS_APPLICATION_RESTRICTED_LOWDELAY, OPUS_OK, OPUS_SET_BITRATE_REQUEST,
     OpusEncoder,
 };
-use windows::{
-    core::*,
-    Win32::{
-        Foundation::*,
-        Media::{
-            Audio::{
-                eConsole, eRender,
-                IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
-                MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-                AUDCLNT_STREAMFLAGS_EVENTCALLBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
-            },
-            // WAVE_FORMAT_EXTENSIBLE lives in KernelStreaming in windows 0.58
-            KernelStreaming::WAVE_FORMAT_EXTENSIBLE,
+use windows::Win32::{
+    Media::{
+        Audio::{
+            eConsole, eRender,
+            IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
+            MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
         },
-        System::{
-            Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED},
-            Threading::{CreateEventW, WaitForSingleObject, INFINITE},
-        },
+        // WAVE_FORMAT_EXTENSIBLE lives in KernelStreaming in windows 0.58
+        KernelStreaming::WAVE_FORMAT_EXTENSIBLE,
+    },
+    System::{
+        Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED},
+        Threading::{CreateEventW, WaitForSingleObject},
     },
 };
 
@@ -122,7 +118,9 @@ fn wasapi_thread(
     ready_tx: tokio::sync::oneshot::Sender<Result<()>>,
 ) -> Result<()> {
     unsafe {
-        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok();
+        // S_FALSE is returned if COM is already initialised on this thread — both
+        // S_OK and S_FALSE are success codes, so .ok() is intentionally discarded.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
         // Get default render (output) device for loopback
         let enumerator: IMMDeviceEnumerator =

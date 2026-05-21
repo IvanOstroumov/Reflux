@@ -14,6 +14,7 @@ use crate::capture::VideoFrame;
 
 /// Encoded video packet (H.264 NAL unit stream).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct EncodedPacket {
     /// H.264 Annex-B byte stream (starts with 0x00 0x00 0x00 0x01).
     pub data: Arc<Vec<u8>>,
@@ -46,6 +47,7 @@ impl std::fmt::Display for EncoderKind {
 
 /// Encoder configuration (matches PRD §5.2 required settings).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct EncoderConfig {
     pub width: u32,
     pub height: u32,
@@ -84,6 +86,7 @@ pub struct Encoder {
 #[cfg(target_os = "windows")]
 unsafe impl Send for Encoder {}
 
+#[allow(dead_code)]
 enum EncoderInner {
     #[cfg(target_os = "windows")]
     MediaFoundation(mf_encoder::MfEncoder),
@@ -126,6 +129,7 @@ impl Encoder {
     }
 
     /// Flush remaining frames out of the encoder (call on session end).
+    #[allow(dead_code)]
     pub fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
         match &mut self.inner {
             #[cfg(target_os = "windows")]
@@ -144,11 +148,12 @@ mod mf_encoder {
     use windows::{
         // Avoid glob-importing windows_core::Result, which would clash with anyhow::Result
         // brought in by `use super::*`.  Import specific items instead.
-        core::{Interface, GUID, VARIANT},
+        core::Interface,
         Win32::Media::MediaFoundation::*,
         Win32::System::Com::*,
     };
 
+    #[allow(dead_code)]
     pub struct MfEncoder {
         transform: IMFTransform,
         input_type: IMFMediaType,
@@ -336,6 +341,7 @@ mod mf_encoder {
             }
         }
 
+        #[allow(dead_code)]
         pub fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
             unsafe {
                 self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)?;
@@ -347,7 +353,7 @@ mod mf_encoder {
         unsafe fn collect_output(&mut self, pts_hint: u64) -> Result<Vec<EncodedPacket>> {
             let mut packets = Vec::new();
             loop {
-                let mut output_data = MFT_OUTPUT_DATA_BUFFER {
+                let output_data = MFT_OUTPUT_DATA_BUFFER {
                     dwStreamID: 0,
                     pSample: std::mem::ManuallyDrop::new(None),
                     dwStatus: 0,
@@ -457,6 +463,7 @@ mod mf_encoder {
 
 // ─── Stub Encoder (non-Windows / testing) ────────────────────────────────────
 
+#[allow(dead_code)]
 mod stub_encoder {
     use super::*;
 

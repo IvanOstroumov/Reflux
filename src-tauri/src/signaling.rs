@@ -82,42 +82,22 @@ pub async fn connect_viewer_signaling(host_ip: &str, port: u16) -> Result<Signal
 }
 
 // ─── WebSocket transport ──────────────────────────────────────────────────────
-// We use a simple line-delimited JSON protocol over raw TCP with a minimal
-// WebSocket framing layer, avoiding heavy deps. In production this should use
-// tokio-tungstenite or a similar battle-tested WS library.
+// Uses newline-delimited JSON over a raw TCP connection.
+// (tokio-tungstenite can be swapped in later by implementing the same interface.)
 
 async fn accept_ws(stream: tokio::net::TcpStream) -> Result<SignalingPeer> {
-    #[cfg(feature = "tungstenite")]
-    {
-        use tokio_tungstenite::accept_async;
-        let ws = accept_async(stream).await?;
-        ws_to_peer(ws).await
-    }
-    // Fallback: raw newline-delimited JSON over TCP
-    #[cfg(not(feature = "tungstenite"))]
-    {
-        raw_tcp_peer(stream).await
-    }
+    raw_tcp_peer(stream).await
 }
 
 async fn connect_ws(url: &str) -> Result<SignalingPeer> {
-    #[cfg(feature = "tungstenite")]
-    {
-        use tokio_tungstenite::connect_async;
-        let (ws, _) = connect_async(url).await?;
-        ws_to_peer(ws).await
-    }
-    #[cfg(not(feature = "tungstenite"))]
-    {
-        // Parse host:port from URL and use raw TCP
-        let addr = url
-            .trim_start_matches("ws://")
-            .trim_end_matches('/')
-            .to_string();
-        let stream = tokio::net::TcpStream::connect(&addr).await
-            .map_err(|e| anyhow!("TCP connect to {addr}: {e}"))?;
-        raw_tcp_peer(stream).await
-    }
+    // Parse host:port from "ws://host:port/" and connect via raw TCP.
+    let addr = url
+        .trim_start_matches("ws://")
+        .trim_end_matches('/')
+        .to_string();
+    let stream = tokio::net::TcpStream::connect(&addr).await
+        .map_err(|e| anyhow!("TCP connect to {addr}: {e}"))?;
+    raw_tcp_peer(stream).await
 }
 
 /// Wrap a raw TCP stream as a SignalingPeer using newline-delimited JSON.

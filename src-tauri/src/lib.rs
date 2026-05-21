@@ -89,11 +89,11 @@ async fn start_host_session(
         max_bitrate_bps: 35_000_000,
         keyframe_interval_secs: 2,
     };
-    let mut enc = encoder::Encoder::new(enc_config).map_err(|e| e.to_string())?;
+    let enc = encoder::Encoder::new(enc_config).map_err(|e| e.to_string())?;
     let encoder_kind = enc.kind.to_string();
 
     // Start audio capture
-    let mut audio_rx = audio::start_audio_capture().await.map_err(|e| e.to_string())?;
+    let audio_rx = audio::start_audio_capture().await.map_err(|e| e.to_string())?;
 
     // Start signaling server on a random port
     let signal_port: u16 = 9001;
