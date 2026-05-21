@@ -44,8 +44,8 @@ pub struct CaptureSession {
     pub method: CaptureMethod,
     pub width: u32,
     pub height: u32,
-    // internal stop signal
-    _stop_tx: tokio::sync::oneshot::Sender<()>,
+    // internal stop signal — pub(crate) so capture_win.rs can construct the struct
+    pub(crate) _stop_tx: tokio::sync::oneshot::Sender<()>,
 }
 
 impl Drop for CaptureSession {
@@ -65,24 +65,20 @@ pub async fn start_capture(
     // Channel with a small backpressure buffer.  If the encoder falls behind
     // we drop frames rather than grow memory unboundedly.
     let (frame_tx, frame_rx) = mpsc::channel::<VideoFrame>(4);
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
     #[cfg(target_os = "windows")]
     {
         use crate::capture_win::{try_wgc, try_dxgi};
 
-        // Try WGC first (§5.1 priority 1)
-        match try_wgc(target.clone(), fps_limit, frame_tx.clone(), stop_rx).await {
+        // Try WGC first (§5.1 priority 1).
+        // Each try_* function creates its own stop channel and stores the real
+        // stop_tx inside the returned CaptureSession.
+        match try_wgc(target.clone(), fps_limit, frame_tx.clone()).await {
             Ok(session) => return Ok((session, frame_rx)),
             Err(wgc_err) => {
                 log::warn!("WGC failed ({wgc_err}), falling back to DXGI");
-                // stop_rx was consumed by the failed wgc attempt; create new channel
-                let (stop_tx2, stop_rx2) = tokio::sync::oneshot::channel::<()>();
-                match try_dxgi(target, fps_limit, frame_tx, stop_rx2).await {
-                    Ok(session) => {
-                        drop(stop_tx); // original sender no longer needed
-                        return Ok((session, frame_rx));
-                    }
+                match try_dxgi(target, fps_limit, frame_tx).await {
+                    Ok(session) => return Ok((session, frame_rx)),
                     Err(dxgi_err) => {
                         return Err(anyhow!(
                             "All capture methods failed. WGC: {wgc_err}. DXGI: {dxgi_err}"
@@ -98,11 +94,11 @@ pub async fn start_capture(
         // On non-Windows (dev machine / CI) run a software fallback that
         // generates synthetic frames so the pipeline can be tested end-to-end.
         log::warn!("Non-Windows platform: using synthetic test frames");
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             use std::time::{Duration, Instant};
             let frame_us = 1_000_000u64 / fps_limit.max(1) as u64;
             let start = Instant::now();
-            let mut stop_rx = stop_rx;
 
             loop {
                 tokio::select! {

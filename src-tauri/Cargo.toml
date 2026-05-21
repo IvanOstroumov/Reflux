@@ -58,8 +58,8 @@ base64 = "0.22"
 
 # Windows-specific dependencies (only compiled on Windows)
 [target.'cfg(target_os = "windows")'.dependencies]
-# Opus audio codec (links libopus — only needed for real WASAPI capture on Windows)
-audiopus = "=0.3.0-rc.0"
+# Opus audio codec — pure-Rust transpilation of libopus; no CMake / C build required.
+unsafe-libopus = "0.2.0"
 # Windows Graphics Capture + DXGI Desktop Duplication
 windows = { version = "0.58", features = [
     # Core
@@ -81,13 +81,23 @@ windows = { version = "0.58", features = [
     "Win32_Media_Audio_Endpoints",
     "Win32_Media_KernelStreaming",
     "Win32_System_Variant",
-    # Encoder / Media Foundation  
+    # Encoder / Media Foundation
     "Win32_Media_MediaFoundation",
     # Window enumeration
     "Win32_UI_WindowsAndMessaging",
     # System info
     "Win32_System_SystemInformation",
     "Win32_System_Performance",
+    # CreateEventW (Threading) needs Security
+    "Win32_Security",
+    # HMONITOR, DXGI_OUTPUT_DESC
+    "Win32_Graphics_Gdi",
+    # CreateDirect3D11DeviceFromDXGIDevice
+    "Win32_System_WinRT_Direct3D11",
+    # IGraphicsCaptureItemInterop
+    "Win32_System_WinRT_Graphics_Capture",
+    # CreateDispatcherQueueController
+    "System",
 ] }
 
 [profile.release]

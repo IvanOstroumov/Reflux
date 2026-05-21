@@ -19,15 +19,16 @@ use windows::{
             Direct3D::D3D_DRIVER_TYPE_HARDWARE,
             Direct3D11::{
                 D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-                D3D11_BIND_FLAG, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE,
+                D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE,
                 D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
             },
             Dxgi::{
                 CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIOutput1,
                 IDXGISurface, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-                DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC,
+                DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+            Gdi::HMONITOR,
         },
         System::{
             Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
@@ -36,6 +37,10 @@ use windows::{
                 DispatcherQueueOptions,
                 DQTAT_COM_STA,
                 DQTYPE_THREAD_DEDICATED,
+                // CreateDirect3D11DeviceFromDXGIDevice lives here in windows 0.58
+                Direct3D11::CreateDirect3D11DeviceFromDXGIDevice,
+                // IGraphicsCaptureItemInterop for HWND/HMONITOR → GraphicsCaptureItem
+                Graphics::Capture::IGraphicsCaptureItemInterop,
             },
         },
         UI::WindowsAndMessaging::{
@@ -46,7 +51,10 @@ use windows::{
         Capture::{
             Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
         },
-        DirectX::{Direct3D11::IDirect3DDevice, DirectXPixelFormat},
+        DirectX::{
+            Direct3D11::{IDirect3DDevice, IDirect3DSurface},
+            DirectXPixelFormat,
+        },
     },
 };
 
@@ -95,10 +103,11 @@ pub async fn try_wgc(
     target: CaptureTarget,
     fps_limit: u32,
     frame_tx: mpsc::Sender<VideoFrame>,
-    mut stop_rx: oneshot::Receiver<()>,
 ) -> Result<CaptureSession> {
     // WGC requires a DispatcherQueue on a dedicated STA thread.
     // We create the item and session on a blocking thread, then loop frames.
+    // The stop channel is owned here; dropping CaptureSession signals the thread.
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
     let (ready_tx, ready_rx) = oneshot::channel::<Result<(u32, u32)>>();
 
     std::thread::spawn(move || {
@@ -130,9 +139,14 @@ pub async fn try_wgc(
             Err(e) => { let _ = ready_tx.send(Err(anyhow!("IDXGIDevice cast: {e}"))); return; }
         };
 
+        // In windows 0.58, CreateDirect3D11DeviceFromDXGIDevice is in
+        // Win32::System::WinRT::Direct3D11 and returns IInspectable; cast to IDirect3DDevice.
         let winrt_device: IDirect3DDevice = unsafe {
-            match windows::Graphics::DirectX::Direct3D11::CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) {
-                Ok(d) => d,
+            match CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) {
+                Ok(inspectable) => match inspectable.cast::<IDirect3DDevice>() {
+                    Ok(d) => d,
+                    Err(e) => { let _ = ready_tx.send(Err(anyhow!("IDirect3DDevice cast: {e}"))); return; }
+                },
                 Err(e) => { let _ = ready_tx.send(Err(anyhow!("WinRT D3D device: {e}"))); return; }
             }
         };
@@ -196,9 +210,12 @@ pub async fn try_wgc(
             .expect("Failed to create staging texture");
 
         loop {
-            // Check stop signal every 16ms
+            // Check stop signal every 16ms (break on explicit stop or sender dropped)
             if last_stop_check.elapsed().as_millis() > 16 {
-                if stop_rx.try_recv().is_ok() { break; }
+                match stop_rx.try_recv() {
+                    Ok(()) | Err(oneshot::error::TryRecvError::Closed) => break,
+                    Err(oneshot::error::TryRecvError::Empty) => {}
+                }
                 last_stop_check = std::time::Instant::now();
             }
 
@@ -268,9 +285,10 @@ pub async fn try_wgc(
                     pts_us,
                 };
 
-                // Non-blocking send — drop frame if encoder backpressured
-                if frame_tx.try_send(vf).is_err() {
-                    // encoder is behind, skip this frame
+                // Non-blocking send — drop frame if encoder backpressured.
+                // Exit if the receiver (encoder) has been dropped.
+                if frame_tx.try_send(vf).is_err() && frame_tx.is_closed() {
+                    break;
                 }
             }
         }
@@ -280,22 +298,15 @@ pub async fn try_wgc(
         let _ = frame_pool.Close();
     });
 
-    // Wait for the thread to confirm capture started
+    // Wait for the thread to confirm capture started.
+    // stop_tx stays here; dropping CaptureSession drops stop_tx which signals
+    // the thread's stop_rx (via TryRecvError::Closed) to exit.
     match ready_rx.await {
         Ok(Ok((w, h))) => Ok(CaptureSession {
             method: CaptureMethod::WindowsGraphicsCapture,
             width: w,
             height: h,
-            _stop_tx: {
-                // The stop_tx was moved into the closure above.
-                // We need a dummy sender since _stop_tx signals stop on drop.
-                // The thread above already has the real stop_rx.
-                // Return a new channel pair where the tx drop signals nothing —
-                // the real stop happens via the oneshot passed to the thread.
-                // (This is a simplification; in production use an Arc<AtomicBool>.)
-                let (tx, _) = oneshot::channel();
-                tx
-            },
+            _stop_tx: stop_tx,
         }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(anyhow!("WGC setup thread panicked")),
@@ -303,9 +314,14 @@ pub async fn try_wgc(
 }
 
 fn capture_item_for_monitor(index: u32) -> Result<GraphicsCaptureItem> {
-    // Enumerate monitors via DXGI factory, pick by index
+    // Enumerate monitors via DXGI factory, pick by index.
+    // Then use IGraphicsCaptureItemInterop::CreateForMonitor (classic Win32 interop path).
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;
+        let interop: IGraphicsCaptureItemInterop =
+            windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
+                .context("IGraphicsCaptureItemInterop factory")?;
+
         let mut adapter_idx = 0u32;
         let mut monitor_count = 0u32;
         loop {
@@ -320,12 +336,12 @@ fn capture_item_for_monitor(index: u32) -> Result<GraphicsCaptureItem> {
                     Err(_) => break,
                 };
                 if monitor_count == index {
-                    let mut desc = DXGI_OUTPUT_DESC::default();
-                    output.GetDesc(&mut desc).ok();
-                    let hmon = desc.Monitor;
-                    return GraphicsCaptureItem::TryCreateFromDisplayId(
-                        windows::Win32::Graphics::Gdi::HMONITOR(hmon.0).into()
-                    ).context("TryCreateFromDisplayId");
+                    // GetDesc returns Result<DXGI_OUTPUT_DESC> in windows 0.58
+                    let desc: DXGI_OUTPUT_DESC = output.GetDesc()
+                        .context("IDXGIOutput::GetDesc")?;
+                    let hmon: HMONITOR = desc.Monitor;
+                    return interop.CreateForMonitor(hmon)
+                        .context("IGraphicsCaptureItemInterop::CreateForMonitor");
                 }
                 monitor_count += 1;
                 output_idx += 1;
@@ -337,9 +353,14 @@ fn capture_item_for_monitor(index: u32) -> Result<GraphicsCaptureItem> {
 }
 
 fn capture_item_for_hwnd(hwnd: HWND) -> Result<GraphicsCaptureItem> {
-    GraphicsCaptureItem::TryCreateFromWindowId(
-        windows::Win32::UI::WindowsAndMessaging::HWND(hwnd.0).into()
-    ).context("TryCreateFromWindowId")
+    // Use the classic Win32 interop COM interface — no WindowId required.
+    unsafe {
+        let interop: IGraphicsCaptureItemInterop =
+            windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
+                .context("IGraphicsCaptureItemInterop factory")?;
+        interop.CreateForWindow(hwnd)
+            .context("IGraphicsCaptureItemInterop::CreateForWindow")
+    }
 }
 
 fn create_staging_texture(device: &ID3D11Device, w: u32, h: u32) -> Result<ID3D11Texture2D> {
@@ -354,9 +375,10 @@ fn create_staging_texture(device: &ID3D11Device, w: u32, h: u32) -> Result<ID3D1
             Quality: 0,
         },
         Usage: D3D11_USAGE_STAGING,
-        BindFlags: D3D11_BIND_FLAG(0),
-        CPUAccessFlags: D3D11_CPU_ACCESS_READ,
-        MiscFlags: windows::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG(0),
+        // In windows 0.58, BindFlags/CPUAccessFlags/MiscFlags are plain u32.
+        BindFlags: 0u32,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0u32,
     };
     let mut tex = None;
     unsafe {
@@ -372,13 +394,13 @@ pub async fn try_dxgi(
     target: CaptureTarget,
     fps_limit: u32,
     frame_tx: mpsc::Sender<VideoFrame>,
-    mut stop_rx: oneshot::Receiver<()>,
 ) -> Result<CaptureSession> {
     let monitor_index = match &target {
         CaptureTarget::Monitor { index } => *index,
         CaptureTarget::Window { .. } => 0, // DXGI always captures the full output
     };
 
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let (ready_tx, ready_rx) = oneshot::channel::<Result<(u32, u32)>>();
 
     std::thread::spawn(move || {
@@ -395,7 +417,7 @@ pub async fn try_dxgi(
             method: CaptureMethod::DxgiDesktopDuplication,
             width: w,
             height: h,
-            _stop_tx: { let (tx, _) = oneshot::channel(); tx },
+            _stop_tx: stop_tx,
         }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(anyhow!("DXGI setup thread panicked")),
@@ -424,8 +446,8 @@ fn dxgi_capture_loop(
         let duplication = output1.DuplicateOutput(&d3d_device)
             .map_err(|e| anyhow!("DuplicateOutput failed: {e}"))?;
 
-        let mut desc = DXGI_OUTDUPL_DESC::default();
-        duplication.GetDesc(&mut desc);
+        // IDXGIOutputDuplication::GetDesc takes 0 args and returns DXGI_OUTDUPL_DESC in windows 0.58.
+        let desc = duplication.GetDesc();
         let w = desc.ModeDesc.Width;
         let h = desc.ModeDesc.Height;
 
@@ -437,7 +459,10 @@ fn dxgi_capture_loop(
         let timeout_ms = (1000 / fps_limit.max(1) + 5).min(50);
 
         loop {
-            if stop_rx.try_recv().is_ok() { break; }
+            match stop_rx.try_recv() {
+                Ok(()) | Err(oneshot::error::TryRecvError::Closed) => break,
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
 
             let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource = None;
@@ -498,7 +523,9 @@ fn dxgi_capture_loop(
                 height: h,
                 pts_us,
             };
-            let _ = frame_tx.try_send(vf);
+            if frame_tx.try_send(vf).is_err() && frame_tx.is_closed() {
+                break;
+            }
         }
     }
     Ok(())
@@ -528,8 +555,11 @@ pub fn enumerate_sources_win() -> Vec<CaptureSource> {
                     Ok(o) => o,
                     Err(_) => break,
                 };
-                let mut desc = DXGI_OUTPUT_DESC::default();
-                let _ = output.GetDesc(&mut desc);
+                // GetDesc returns Result<DXGI_OUTPUT_DESC> in windows 0.58
+                let desc: DXGI_OUTPUT_DESC = match output.GetDesc() {
+                    Ok(d) => d,
+                    Err(_) => { output_idx += 1; continue; }
+                };
                 let rect = desc.DesktopCoordinates;
                 let w = (rect.right - rect.left) as u32;
                 let h = (rect.bottom - rect.top) as u32;

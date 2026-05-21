@@ -77,6 +77,13 @@ pub struct Encoder {
     inner: EncoderInner,
 }
 
+// SAFETY: Windows hardware MFTs (NVENC, AMF, QuickSync) are free-threaded COM
+// objects — they do not have STA apartment affinity and can be safely moved
+// between threads.  The windows-rs crate conservatively omits the Send impl
+// for all COM interfaces, so we opt back in here.
+#[cfg(target_os = "windows")]
+unsafe impl Send for Encoder {}
+
 enum EncoderInner {
     #[cfg(target_os = "windows")]
     MediaFoundation(mf_encoder::MfEncoder),
@@ -135,7 +142,9 @@ mod mf_encoder {
     use super::*;
     use anyhow::Context;
     use windows::{
-        core::*,
+        // Avoid glob-importing windows_core::Result, which would clash with anyhow::Result
+        // brought in by `use super::*`.  Import specific items instead.
+        core::{Interface, GUID, VARIANT},
         Win32::Media::MediaFoundation::*,
         Win32::System::Com::*,
     };
@@ -167,18 +176,7 @@ mod mf_encoder {
                 let mut count = 0u32;
                 let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
 
-                let attrs = create_mf_attrs(&[
-                    (MF_TRANSFORM_CATEGORY_Attribute, MFT_CATEGORY_VIDEO_ENCODER.0 as u64),
-                ])?;
-
-                // Request hardware-only encoders
-                let hw_flag_attr = create_mf_attrs(&[])?;
-                hw_flag_attr.SetUINT32(
-                    &MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
-                    1,
-                ).ok();
-
-                let mut flags: MFT_ENUM_FLAG = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
+                let flags: MFT_ENUM_FLAG = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
 
                 let input_type_info = MFT_REGISTER_TYPE_INFO {
                     guidMajorType: MFMediaType_Video,
@@ -209,9 +207,10 @@ mod mf_encoder {
                     .ok_or_else(|| anyhow!("Null IMFActivate"))?
                     .clone();
 
-                // Determine which encoder vendor this is
-                let mut name_len = 0u32;
-                let kind = if activate.GetStringLength(&MFT_FRIENDLY_NAME_Attribute, &mut name_len).is_ok() {
+                // Determine which encoder vendor this is.
+                // GetStringLength in windows 0.58 takes only the GUID and returns Result<u32>.
+                let kind = if let Ok(name_len) = activate.GetStringLength(&MFT_FRIENDLY_NAME_Attribute) {
+                    let mut name_len = name_len; // make mutable for the GetString call below
                     let mut name_buf = vec![0u16; name_len as usize + 1];
                     let _ = activate.GetString(
                         &MFT_FRIENDLY_NAME_Attribute,
@@ -253,8 +252,6 @@ mod mf_encoder {
                 output_mt.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
                 // H.264 Baseline profile for maximum decoder compatibility
                 output_mt.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
-                // CBR rate control (PRD requirement)
-                output_mt.SetUINT32(&MF_MT_VIDEO_PROFILE, 0)?;
                 transform.SetOutputType(0, &output_mt, 0)?;
 
                 // Configure input type (NV12 — native GPU format)
@@ -358,13 +355,17 @@ mod mf_encoder {
                 };
                 let mut status = 0u32;
 
-                match self.transform.ProcessOutput(0, &mut [output_data], &mut status) {
+                // ProcessOutput in windows 0.58 takes a slice of buffers (count is implicit).
+                // Use a local array so we can access buffers[0].pSample after the call
+                // (avoids a borrow-after-move issue with output_data).
+                let mut buffers = [output_data];
+                match self.transform.ProcessOutput(0, &mut buffers, &mut status) {
                     Ok(()) => {}
                     Err(e) if e.code().0 as u32 == 0xC00D6D72 /* MF_E_TRANSFORM_NEED_MORE_INPUT */ => break,
                     Err(e) => return Err(anyhow!("ProcessOutput: {e}")),
                 }
 
-                let sample_opt = std::mem::ManuallyDrop::take(&mut output_data.pSample);
+                let sample_opt = std::mem::ManuallyDrop::take(&mut buffers[0].pSample);
                 if let Some(sample) = sample_opt {
                     let pts_us = sample.GetSampleTime().map(|t| t as u64 / 10).unwrap_or(pts_hint);
 
@@ -395,27 +396,9 @@ mod mf_encoder {
         ((hi as u64) << 32) | lo as u64
     }
 
-    fn com_variant_u32(val: u32) -> windows::Win32::System::Variant::VARIANT {
-        use windows::Win32::System::Variant::*;
-        let mut v = VARIANT::default();
-        unsafe {
-            v.Anonymous.Anonymous.vt = VT_UI4;
-            v.Anonymous.Anonymous.Anonymous.uintVal = val;
-        }
-        v
-    }
-
-    fn create_mf_attrs(pairs: &[(GUID, u64)]) -> Result<IMFAttributes> {
-        use windows::Win32::Media::MediaFoundation::MFCreateAttributes;
-        unsafe {
-            let mut attrs = None;
-            MFCreateAttributes(&mut attrs, pairs.len() as u32 + 1)?;
-            let attrs = attrs.unwrap();
-            for (guid, val) in pairs {
-                attrs.SetUINT64(guid, *val)?;
-            }
-            Ok(attrs)
-        }
+    fn com_variant_u32(val: u32) -> windows::core::VARIANT {
+        // windows::core::VARIANT has From<u32> that sets VT_UI4 correctly.
+        windows::core::VARIANT::from(val)
     }
 
     fn is_idr_nal(data: &[u8]) -> bool {

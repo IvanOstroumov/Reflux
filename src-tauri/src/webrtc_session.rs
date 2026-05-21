@@ -35,7 +35,8 @@ use webrtc::{
         rtp_codec::{
             RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
         },
-        RTCRtpTransceiverDirection,
+        // In webrtc 0.11 the direction enum lives in its own sub-module.
+        rtp_transceiver_direction::RTCRtpTransceiverDirection,
     },
     track::{
         track_local::{track_local_static_sample::TrackLocalStaticSample, TrackLocal},
@@ -155,14 +156,15 @@ impl HostSession {
     }
 
     /// Register connection state change callback.
-    pub async fn on_connection_state_change<F>(&self, f: F)
+    /// In webrtc 0.11, on_peer_connection_state_change is a sync fn — no .await.
+    pub fn on_connection_state_change<F>(&self, f: F)
     where
         F: Fn(RTCPeerConnectionState) + Send + Sync + 'static,
     {
         self.pc.on_peer_connection_state_change(Box::new(move |s| {
             f(s);
             Box::pin(async {})
-        })).await;
+        }));
     }
 
     /// Close the connection.
@@ -188,10 +190,11 @@ impl ViewerSession {
         let (pc, _v, _a) = create_peer_connection(false).await?;
 
         // Register track handler — called when remote tracks arrive.
+        // In webrtc 0.11, on_track is a sync fn; codec() is also sync now.
         pc.on_track(Box::new(move |track, _receiver, _transceiver| {
             let app = app.clone();
             Box::pin(async move {
-                let codec = track.codec().await;
+                let codec = track.codec(); // sync in 0.11 — no .await
                 let mime = codec.capability.mime_type.to_lowercase();
                 log::info!("Remote track: {mime}");
 
@@ -201,7 +204,7 @@ impl ViewerSession {
                     tokio::spawn(async move { decode_opus_track(track, app).await; });
                 }
             })
-        })).await;
+        })); // sync — no .await
 
         // Set remote offer
         let offer = RTCSessionDescription::offer(sdp)
@@ -234,13 +237,13 @@ impl ViewerSession {
         self.pc.add_ice_candidate(init).await.map_err(|e| anyhow!("{e}"))
     }
 
-    pub async fn on_connection_state_change<F>(&self, f: F)
+    pub fn on_connection_state_change<F>(&self, f: F)
     where F: Fn(RTCPeerConnectionState) + Send + Sync + 'static
     {
         self.pc.on_peer_connection_state_change(Box::new(move |s| {
             f(s);
             Box::pin(async {})
-        })).await;
+        }));
     }
 
     pub async fn close(&self) -> Result<()> {
@@ -475,17 +478,11 @@ pub async fn run_host_session(
 
     session.set_answer(answer_sdp).await?;
 
-    // Forward any remaining ICE candidates from viewer
-    // (handled asynchronously below in the signal loop)
-
     let _ = state_tx.send("streaming".to_string()).await;
 
-    // Spawn signal listener for ICE candidates
-    let pc_for_ice = Arc::new(session); // wrap in Arc for sharing
-    // Note: in a full impl you'd spawn a task to drain peer.rx for ICE candidates.
-    // Simplified here for clarity.
+    let pc_for_ice = Arc::new(session);
 
-    // Main streaming loop
+    // Main streaming loop — also drains late ICE candidates from the viewer.
     let mut video_bytes_sent: u64 = 0;
     let mut audio_bytes_sent: u64 = 0;
 
@@ -501,6 +498,16 @@ pub async fn run_host_session(
                 audio_bytes_sent += pkt.data.len() as u64;
                 if let Err(e) = pc_for_ice.send_audio(&pkt).await {
                     log::warn!("Audio send error: {e}");
+                }
+            }
+            msg = peer.rx.recv() => {
+                match msg {
+                    Some(SignalMessage::IceCandidate { candidate, .. }) => {
+                        let _ = pc_for_ice.add_ice_candidate(&candidate).await;
+                    }
+                    // Viewer sent Bye or signaling channel closed — end session.
+                    Some(SignalMessage::Bye) | None => break,
+                    _ => {}
                 }
             }
             else => break,

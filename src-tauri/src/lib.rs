@@ -124,44 +124,47 @@ async fn start_host_session(
     let (video_enc_tx, video_enc_rx) = mpsc::channel::<encoder::EncodedPacket>(8);
 
     // Stop signal
-    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel::<()>();
     *state.stop_tx.lock().await = Some(stop_tx);
 
     let app_clone = app.clone();
     let state_clone = Arc::clone(&state);
 
-    // Spawn pipeline task
-    tokio::spawn(async move {
-        // Encode loop: frame_rx → encoder → video_enc_tx
-        let app2 = app_clone.clone();
-        let enc_task = tokio::spawn(async move {
-            let mut enc = enc;
-            while let Some(frame) = frame_rx.recv().await {
-                match enc.encode(&frame) {
-                    Ok(packets) => {
-                        for pkt in packets {
-                            if video_enc_tx.send(pkt).await.is_err() { break; }
+    // The Media Foundation encoder holds COM interfaces that are !Send, so the
+    // encode loop must run on a plain OS thread rather than a tokio task.
+    // blocking_recv / blocking_send are the tokio mpsc bridge for non-async threads.
+    let app2 = app_clone.clone();
+    std::thread::spawn(move || {
+        let mut enc = enc;
+        while let Some(frame) = frame_rx.blocking_recv() {
+            match enc.encode(&frame) {
+                Ok(packets) => {
+                    for pkt in packets {
+                        if video_enc_tx.blocking_send(pkt).is_err() {
+                            return; // viewer disconnected
                         }
                     }
-                    Err(e) => {
-                        log::error!("Encoder error: {e}");
-                        emit_error(&app2, &format!("Encoder error: {e}"));
-                        break;
-                    }
+                }
+                Err(e) => {
+                    log::error!("Encoder error: {e}");
+                    emit_error(&app2, &format!("Encoder error: {e}"));
+                    return;
                 }
             }
-        });
+        }
+    });
 
+    // Separate async task for signaling handshake + WebRTC session.
+    tokio::spawn(async move {
         // Wait for viewer to connect
-        let app3 = app_clone.clone();
         let peer = match peer_ready_rx.await {
             Ok(Ok(p)) => p,
             Ok(Err(e)) => {
-                emit_error(&app3, &format!("Signaling error: {e}"));
+                emit_error(&app_clone, &format!("Signaling error: {e}"));
                 return;
             }
             Err(_) => {
-                emit_error(&app3, "Signaling channel closed unexpectedly");
+                emit_error(&app_clone, "Signaling channel closed unexpectedly");
                 return;
             }
         };
