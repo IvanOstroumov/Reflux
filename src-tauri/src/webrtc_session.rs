@@ -14,7 +14,7 @@ use anyhow::{anyhow, Result};
 use base64::Engine;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use webrtc::{
     api::{
         interceptor_registry::register_default_interceptors,
@@ -77,6 +77,8 @@ pub struct HostSession {
     pc: Arc<RTCPeerConnection>,
     video_track: Arc<TrackLocalStaticSample>,
     audio_track: Arc<TrackLocalStaticSample>,
+    /// Receives ICE/DTLS connection state updates set by the callback below.
+    state_rx: watch::Receiver<RTCPeerConnectionState>,
 }
 
 impl HostSession {
@@ -84,6 +86,18 @@ impl HostSession {
     /// Returns the session and the offer SDP string.
     pub async fn new() -> Result<(Self, String)> {
         let (pc, video_track, audio_track) = create_peer_connection(true).await?;
+
+        // Wire up ICE / DTLS connection state so we know when the peer is reachable.
+        let (state_tx, state_rx) = watch::channel(RTCPeerConnectionState::New);
+        let state_tx = Arc::new(state_tx);
+        {
+            let state_tx = Arc::clone(&state_tx);
+            pc.on_peer_connection_state_change(Box::new(move |s| {
+                log::info!("Host WebRTC state: {s:?}");
+                let _ = state_tx.send(s);
+                Box::pin(async {})
+            }));
+        }
 
         // Generate offer
         let offer = pc.create_offer(None).await
@@ -103,7 +117,7 @@ impl HostSession {
         let local_desc = pc.local_description().await
             .ok_or_else(|| anyhow!("No local description after gathering"))?;
 
-        Ok((HostSession { pc, video_track, audio_track }, local_desc.sdp))
+        Ok((HostSession { pc, video_track, audio_track, state_rx }, local_desc.sdp))
     }
 
     /// Complete handshake: set the viewer's SDP answer.
@@ -156,17 +170,10 @@ impl HostSession {
             .map_err(|e| anyhow!("audio write_sample: {e}"))
     }
 
-    /// Register connection state change callback.
-    /// In webrtc 0.11, on_peer_connection_state_change is a sync fn — no .await.
-    #[allow(dead_code)]
-    pub fn on_connection_state_change<F>(&self, f: F)
-    where
-        F: Fn(RTCPeerConnectionState) + Send + Sync + 'static,
-    {
-        self.pc.on_peer_connection_state_change(Box::new(move |s| {
-            f(s);
-            Box::pin(async {})
-        }));
+    /// Block until the WebRTC ICE+DTLS handshake reaches `Connected`,
+    /// or return an error on `Failed` / timeout.
+    pub async fn wait_for_connection(&self) -> Result<()> {
+        wait_for_ice_connected(self.state_rx.clone(), 30).await
     }
 
     /// Close the connection.
@@ -183,6 +190,7 @@ impl HostSession {
 /// WebView decodes with WebCodecs (GPU-accelerated) and renders to a canvas.
 pub struct ViewerSession {
     pc: Arc<RTCPeerConnection>,
+    state_rx: watch::Receiver<RTCPeerConnectionState>,
 }
 
 impl ViewerSession {
@@ -190,6 +198,18 @@ impl ViewerSession {
     /// an SDP answer. `app` is used by the decoder tasks to emit media events.
     pub async fn from_offer(sdp: String, app: AppHandle) -> Result<(Self, String)> {
         let (pc, _v, _a) = create_peer_connection(false).await?;
+
+        // Wire ICE state so we can wait for actual connectivity.
+        let (state_tx, state_rx) = watch::channel(RTCPeerConnectionState::New);
+        let state_tx = Arc::new(state_tx);
+        {
+            let state_tx = Arc::clone(&state_tx);
+            pc.on_peer_connection_state_change(Box::new(move |s| {
+                log::info!("Viewer WebRTC state: {s:?}");
+                let _ = state_tx.send(s);
+                Box::pin(async {})
+            }));
+        }
 
         // Register track handler — called when remote tracks arrive.
         // In webrtc 0.11, on_track is a sync fn; codec() is also sync now.
@@ -230,7 +250,7 @@ impl ViewerSession {
         let local_desc = pc.local_description().await
             .ok_or_else(|| anyhow!("No local description"))?;
 
-        Ok((ViewerSession { pc }, local_desc.sdp))
+        Ok((ViewerSession { pc, state_rx }, local_desc.sdp))
     }
 
     pub async fn add_ice_candidate(&self, candidate: &str) -> Result<()> {
@@ -239,18 +259,56 @@ impl ViewerSession {
         self.pc.add_ice_candidate(init).await.map_err(|e| anyhow!("{e}"))
     }
 
-    #[allow(dead_code)]
-    pub fn on_connection_state_change<F>(&self, f: F)
-    where F: Fn(RTCPeerConnectionState) + Send + Sync + 'static
-    {
-        self.pc.on_peer_connection_state_change(Box::new(move |s| {
-            f(s);
-            Box::pin(async {})
-        }));
+    /// Block until ICE+DTLS reaches `Connected`, or error on failure/timeout.
+    pub async fn wait_for_connection(&self) -> Result<()> {
+        wait_for_ice_connected(self.state_rx.clone(), 30).await
     }
 
     pub async fn close(&self) -> Result<()> {
         self.pc.close().await.map_err(|e| anyhow!("{e}"))
+    }
+}
+
+// ─── ICE connection waiter ────────────────────────────────────────────────────
+
+/// Wait until the peer connection reaches `Connected`, or return an error on
+/// `Failed`/`Closed` or if `timeout_secs` elapses without connecting.
+///
+/// This ensures we only declare "streaming" when the ICE + DTLS handshake has
+/// actually completed and RTP can flow — not merely when SDP was exchanged.
+async fn wait_for_ice_connected(
+    mut rx: watch::Receiver<RTCPeerConnectionState>,
+    timeout_secs: u64,
+) -> Result<()> {
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
+    tokio::pin!(timeout);
+    loop {
+        let state = *rx.borrow();
+        match state {
+            RTCPeerConnectionState::Connected => {
+                log::info!("WebRTC ICE connected ✓");
+                return Ok(());
+            }
+            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
+                return Err(anyhow!(
+                    "WebRTC ICE failed (state={state:?}). \
+                     If testing locally, allow the app through Windows Firewall \
+                     (UDP traffic between the two instances must not be blocked)."
+                ));
+            }
+            _ => {}
+        }
+        tokio::select! {
+            res = rx.changed() => {
+                if res.is_err() { return Err(anyhow!("ICE state channel closed")); }
+            }
+            _ = &mut timeout => {
+                return Err(anyhow!(
+                    "WebRTC ICE timed out after {timeout_secs}s — peers could not reach \
+                     each other. Check Windows Firewall or try a TURN relay."
+                ));
+            }
+        }
     }
 }
 
@@ -480,6 +538,12 @@ pub async fn run_host_session(
     };
 
     session.set_answer(answer_sdp).await?;
+
+    // Block until ICE+DTLS actually connects before claiming we're streaming.
+    // On failure or timeout this returns Err which the caller will surface as
+    // a session-error event so the user sees a real message instead of silence.
+    log::info!("Waiting for WebRTC ICE connection…");
+    session.wait_for_connection().await?;
 
     let _ = state_tx.send("streaming".to_string()).await;
 

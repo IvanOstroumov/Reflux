@@ -335,6 +335,10 @@ async fn run_viewer_session(mut peer: signaling::SignalingPeer, app: AppHandle) 
     peer.tx.send(SignalMessage::Answer { sdp: answer_sdp }).await
         .map_err(|e| anyhow::anyhow!("send answer: {e}"))?;
 
+    // Wait for ICE to actually connect — only then is media flowing.
+    log::info!("Viewer waiting for WebRTC ICE connection…");
+    viewer_session.wait_for_connection().await?;
+
     emit_status(&app, "streaming", None);
 
     // Forward remaining ICE candidates

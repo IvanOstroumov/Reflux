@@ -256,6 +256,7 @@ export default function App() {
     if (!code) { setError('Enter the invite code from the host.'); return }
     setError(null)
     setMode('viewer')
+    setStatus('connecting') // show spinner immediately, prevents double-click
     try {
       await invoke('join_viewer_session', { inviteCode: code })
     } catch (e) {
