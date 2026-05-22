@@ -33,7 +33,8 @@ use webrtc::{
     rtp::{codecs::h264::H264Packet, packetizer::Depacketizer},
     rtp_transceiver::{
         rtp_codec::{
-            RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
+            RTCRtpCodecCapability, RTCRtpCodecParameters, RTCRtpHeaderExtensionCapability,
+            RTPCodecType,
         },
         // In webrtc 0.11 the direction enum lives in its own sub-module.
         rtp_transceiver_direction::RTCRtpTransceiverDirection,
@@ -352,6 +353,23 @@ async fn create_peer_connection(
         },
         RTPCodecType::Audio,
     ).map_err(|e| anyhow!("register Opus codec: {e}"))?;
+
+    // Register the MID header extension. Without it, a receiver cannot demux
+    // bundled video+audio RTP streams that share one transport: when an RTP
+    // packet arrives whose SSRC isn't matched to a track, webrtc-rs needs the
+    // MID extension to know which track it belongs to. Missing it caused the
+    // viewer to log "mid RTP Extensions required for Simulcast" and silently
+    // drop all video (audio happened to match by SSRC, video did not).
+    const MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
+    for typ in [RTPCodecType::Video, RTPCodecType::Audio] {
+        media_engine
+            .register_header_extension(
+                RTCRtpHeaderExtensionCapability { uri: MID_URI.to_owned() },
+                typ,
+                None,
+            )
+            .map_err(|e| anyhow!("register MID header extension: {e}"))?;
+    }
 
     let mut registry = Registry::new();
     registry = register_default_interceptors(registry, &mut media_engine)
