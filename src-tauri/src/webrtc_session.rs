@@ -14,7 +14,7 @@ use anyhow::{anyhow, Result};
 use base64::Engine;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use webrtc::{
     api::{
         interceptor_registry::register_default_interceptors,
@@ -511,8 +511,8 @@ async fn decode_opus_track(track: Arc<TrackRemote>, app: AppHandle) {
 /// capture → encode → WebRTC → viewer.
 /// This is called from the Tauri command and runs until the session ends.
 pub async fn run_host_session(
-    mut video_rx: mpsc::Receiver<EncodedPacket>,
-    mut audio_rx: mpsc::Receiver<AudioPacket>,
+    mut video_rx: broadcast::Receiver<EncodedPacket>,
+    mut audio_rx: broadcast::Receiver<AudioPacket>,
     mut peer: SignalingPeer,
     state_tx: mpsc::Sender<String>,
 ) -> Result<()> {
@@ -555,16 +555,34 @@ pub async fn run_host_session(
 
     loop {
         tokio::select! {
-            Some(pkt) = video_rx.recv() => {
-                video_bytes_sent += pkt.data.len() as u64;
-                if let Err(e) = pc_for_ice.send_video(&pkt).await {
-                    log::warn!("Video send error: {e}");
+            result = video_rx.recv() => {
+                match result {
+                    Ok(pkt) => {
+                        video_bytes_sent += pkt.data.len() as u64;
+                        if let Err(e) = pc_for_ice.send_video(&pkt).await {
+                            log::warn!("Video send error: {e}");
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // Consumer is too slow; encoder dropped n frames.
+                        // The next keyframe (every 2s) will recover cleanly.
+                        log::warn!("Video broadcast lagged by {n} frames — skipping");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-            Some(pkt) = audio_rx.recv() => {
-                audio_bytes_sent += pkt.data.len() as u64;
-                if let Err(e) = pc_for_ice.send_audio(&pkt).await {
-                    log::warn!("Audio send error: {e}");
+            result = audio_rx.recv() => {
+                match result {
+                    Ok(pkt) => {
+                        audio_bytes_sent += pkt.data.len() as u64;
+                        if let Err(e) = pc_for_ice.send_audio(&pkt).await {
+                            log::warn!("Audio send error: {e}");
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!("Audio broadcast lagged by {n} packets — skipping");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
             msg = peer.rx.recv() => {
@@ -577,7 +595,6 @@ pub async fn run_host_session(
                     _ => {}
                 }
             }
-            else => break,
         }
     }
 
