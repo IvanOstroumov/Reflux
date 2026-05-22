@@ -44,6 +44,10 @@ struct AppState {
     session: Mutex<Option<SessionState>>,
     /// Fired when the user explicitly stops the session (Stop / Cancel button).
     stop_notify: Arc<Notify>,
+    /// Abort handle for the currently-running viewer task.
+    /// Stored so `stop_session` can cancel it immediately instead of leaving
+    /// a zombie task in the background on every Cancel click.
+    viewer_task: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 // ─── Tauri Commands ───────────────────────────────────────────────────────────
@@ -281,7 +285,7 @@ async fn start_host_session(
 async fn join_viewer_session(
     invite_code: String,
     app: AppHandle,
-    _state: State<'_, Arc<AppState>>,
+    state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
     let (host_ip, port, _token) =
         signaling::decode_invite(&invite_code).map_err(|e| e.to_string())?;
@@ -293,13 +297,15 @@ async fn join_viewer_session(
         .map_err(|e| format!("Cannot reach host: {e}"))?;
 
     let app2 = app.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         if let Err(e) = run_viewer_session(peer, app2.clone()).await {
             log::error!("Viewer session error: {e}");
             emit_error(&app2, &e.to_string());
             emit_status(&app2, "disconnected", None);
         }
     });
+    // Store the abort handle so stop_session() can cancel this task immediately.
+    *state.viewer_task.lock().await = Some(handle.abort_handle());
 
     Ok(())
 }
@@ -307,10 +313,15 @@ async fn join_viewer_session(
 /// Stop the active session (either role).
 #[tauri::command]
 async fn stop_session(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    // Signal the session manager loop to exit.
+    // Signal the host session manager loop to exit.
     state.stop_notify.notify_one();
     // Clear frontend-visible session state immediately.
     *state.session.lock().await = None;
+    // Abort any running viewer task so Cancel actually stops it instead of
+    // leaving a zombie background task that keeps trying to connect.
+    if let Some(handle) = state.viewer_task.lock().await.take() {
+        handle.abort();
+    }
     Ok(())
 }
 
@@ -362,6 +373,7 @@ pub fn run() {
     let app_state = Arc::new(AppState {
         session: Mutex::new(None),
         stop_notify: Arc::new(Notify::new()),
+        viewer_task: Mutex::new(None),
     });
 
     tauri::Builder::default()
@@ -383,7 +395,31 @@ pub fn run() {
 
 // ─── Viewer session orchestration ─────────────────────────────────────────────
 
-async fn run_viewer_session(mut peer: signaling::SignalingPeer, app: AppHandle) -> Result<()> {
+/// Outer wrapper — imposes a hard 45-second deadline on the entire viewer
+/// session (signaling + SDP exchange + ICE + streaming).
+///
+/// Why: webrtc-rs can stall inside internal async locks (ICE setup, DTLS
+/// handshake) before `wait_for_connection()`'s 30-second timer even starts.
+/// This outer timeout guarantees the task always terminates so the user can
+/// retry, regardless of where the hang occurs.
+async fn run_viewer_session(peer: signaling::SignalingPeer, app: AppHandle) -> Result<()> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        run_viewer_session_inner(peer, app),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err(anyhow::anyhow!(
+            "Connection timed out after 45 s. \
+             If both peers are on the same machine, add a Windows Firewall rule \
+             that allows UDP for gameshare.exe. \
+             For internet play, make sure port forwarding or a TURN relay is configured."
+        )),
+    }
+}
+
+async fn run_viewer_session_inner(mut peer: signaling::SignalingPeer, app: AppHandle) -> Result<()> {
     // Wait for offer from host
     let offer_sdp = loop {
         match peer.rx.recv().await {
