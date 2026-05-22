@@ -377,9 +377,9 @@ export default function App() {
             <input
               className="code-input"
               value={viewerInput}
-              onChange={e => setViewerInput(e.target.value.toUpperCase())}
+              onChange={e => setViewerInput(e.target.value.trim())}
               onKeyDown={e => e.key === 'Enter' && handleJoinViewer()}
-              placeholder="XXXX-XXXX or base64 invite"
+              placeholder="Paste invite code from host"
               autoFocus
               spellCheck={false}
             />
