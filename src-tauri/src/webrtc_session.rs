@@ -575,6 +575,7 @@ pub async fn run_host_session(
     // Main streaming loop — also drains late ICE candidates from the viewer.
     let mut video_bytes_sent: u64 = 0;
     let mut audio_bytes_sent: u64 = 0;
+    let mut video_pkts_sent: u64 = 0;
 
     loop {
         tokio::select! {
@@ -582,6 +583,16 @@ pub async fn run_host_session(
                 match result {
                     Ok(pkt) => {
                         video_bytes_sent += pkt.data.len() as u64;
+                        video_pkts_sent += 1;
+                        if video_pkts_sent == 1 {
+                            log::info!(
+                                "Host: sending first video packet ({} bytes, keyframe={})",
+                                pkt.data.len(), pkt.is_keyframe
+                            );
+                        } else if video_pkts_sent % 120 == 0 {
+                            log::info!("Host: {video_pkts_sent} video packets sent ({} KB total)",
+                                video_bytes_sent / 1024);
+                        }
                         if let Err(e) = pc_for_ice.send_video(&pkt).await {
                             log::warn!("Video send error: {e}");
                         }

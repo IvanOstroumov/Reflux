@@ -123,10 +123,14 @@ async fn start_host_session(
     let app_enc = app.clone();
     std::thread::spawn(move || {
         let mut enc = enc;
+        let mut frames_in: u64 = 0;
+        let mut packets_out: u64 = 0;
         while let Some(frame) = frame_rx.blocking_recv() {
+            frames_in += 1;
             match enc.encode(&frame) {
                 Ok(packets) => {
                     for pkt in packets {
+                        packets_out += 1;
                         // Ignore if no active subscriber — they'll get the next keyframe.
                         let _ = video_bcast.send(pkt);
                     }
@@ -137,7 +141,16 @@ async fn start_host_session(
                     return;
                 }
             }
+            // Heartbeat every ~2 s so we can see if video is actually flowing.
+            if frames_in % 120 == 0 {
+                log::info!(
+                    "Encoder pipeline: {frames_in} frames captured → {packets_out} packets encoded"
+                );
+            }
         }
+        log::warn!(
+            "Encoder thread exited — capture channel closed (frames_in={frames_in})"
+        );
     });
 
     // ── Audio bridge: mpsc → broadcast ───────────────────────────────────────
@@ -337,15 +350,15 @@ async fn join_viewer_session(
     let app2 = app.clone();
     let app_wd = app.clone(); // watchdog owns its own AppHandle clone
 
-    // AtomicBool: viewer task sets this to `true` when it finishes (success or
-    // error). The OS-thread watchdog reads it before deciding whether to fire.
-    let done = Arc::new(AtomicBool::new(false));
-    let done_task = Arc::clone(&done);
+    // AtomicBool: viewer task sets this to `true` the moment the WebRTC
+    // connection is established (reaches the streaming phase). The OS-thread
+    // watchdog only fires if this is still `false` after the deadline — so it
+    // catches a *stuck connection setup* without ever killing a working stream.
+    let connected = Arc::new(AtomicBool::new(false));
+    let connected_task = Arc::clone(&connected);
 
     let handle = tokio::spawn(async move {
-        let result = run_viewer_session(peer, app2.clone()).await;
-        // Mark done BEFORE emitting so the watchdog never double-fires.
-        done_task.store(true, Ordering::Release);
+        let result = run_viewer_session(peer, app2.clone(), connected_task).await;
         if let Err(e) = result {
             log::error!("Viewer session error: {e}");
             emit_error(&app2, &e.to_string());
@@ -364,14 +377,14 @@ async fn join_viewer_session(
     // sit in the run queue with no thread to execute on, so they never fire.
     //
     // std::thread::sleep is immune to this — it uses the OS scheduler directly.
-    // After 45 s, we abort the stuck task and surface a clear error so the
-    // user can retry (and see the Windows Firewall instructions if needed).
+    // It ONLY fires if the connection never reached the streaming phase, so a
+    // successfully-connected session is never killed.
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(45));
-        if done.load(Ordering::Acquire) {
-            return; // task already finished normally — nothing to do
+        if connected.load(Ordering::Acquire) {
+            return; // connection succeeded — leave the live session alone
         }
-        log::warn!("Viewer session watchdog fired after 45 s — aborting stuck task");
+        log::warn!("Viewer connection watchdog fired after 45 s — aborting stuck setup");
         abort_for_watchdog.abort();
         emit_error(
             &app_wd,
@@ -472,7 +485,11 @@ pub fn run() {
 
 // ─── Viewer session orchestration ─────────────────────────────────────────────
 
-async fn run_viewer_session(mut peer: signaling::SignalingPeer, app: AppHandle) -> Result<()> {
+async fn run_viewer_session(
+    mut peer: signaling::SignalingPeer,
+    app: AppHandle,
+    connected: Arc<AtomicBool>,
+) -> Result<()> {
     // Wait for offer from host
     let offer_sdp = loop {
         match peer.rx.recv().await {
@@ -492,6 +509,9 @@ async fn run_viewer_session(mut peer: signaling::SignalingPeer, app: AppHandle) 
     log::info!("Viewer waiting for WebRTC ICE connection…");
     viewer_session.wait_for_connection().await?;
 
+    // Connection established — tell the watchdog to stand down before we settle
+    // into the (potentially long-lived) streaming phase.
+    connected.store(true, Ordering::Release);
     emit_status(&app, "streaming", None);
 
     while let Some(msg) = peer.rx.recv().await {
