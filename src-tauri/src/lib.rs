@@ -204,6 +204,13 @@ async fn start_host_session(
     //   3. On disconnect / failure → restart signaling → new invite code → loop
     //   4. On stop_notify → exit cleanly
     tokio::spawn(async move {
+        // Keep the capture session alive for the whole host session. Dropping
+        // it signals the capture thread to stop, which closes the frame
+        // channel and kills the encoder thread. Previously it was dropped the
+        // instant start_host_session returned, so the encoder saw frames_in=0
+        // and exited immediately — no video was ever produced.
+        let _capture_session = capture_session;
+
         // First iteration reuses the pre-created signaling server.
         let mut pending_peer_rx = Some(first_peer_rx);
         let mut first = true;
