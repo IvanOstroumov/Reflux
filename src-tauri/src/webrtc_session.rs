@@ -518,22 +518,45 @@ pub async fn run_host_session(
 ) -> Result<()> {
     let _ = state_tx.send("connecting".to_string()).await;
 
-    let (session, offer_sdp) = HostSession::new().await?;
+    // Wrap session creation in a timeout — webrtc-rs can stall inside its own
+    // async locks (ICE setup, DTLS init) before our own ICE timer even starts,
+    // which would leave the session manager permanently stuck on this viewer.
+    let (session, offer_sdp) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        HostSession::new(),
+    )
+    .await
+    .unwrap_or_else(|_| Err(anyhow!("Host session init timed out after 10 s")))?;
 
     // Send offer to viewer
     peer.tx.send(SignalMessage::Offer { sdp: offer_sdp }).await
         .map_err(|e| anyhow!("send offer: {e}"))?;
 
-    // Exchange ICE candidates and wait for answer concurrently
+    // Exchange ICE candidates and wait for answer — bounded by 15 s.
+    // Without a deadline, a viewer that TCP-connects then crashes before
+    // sending an answer would leave the host stuck here forever, preventing
+    // the session manager from restarting with a new invite code.
+    let answer_deadline = tokio::time::sleep(std::time::Duration::from_secs(15));
+    tokio::pin!(answer_deadline);
     let answer_sdp = loop {
-        match peer.rx.recv().await {
-            Some(SignalMessage::Answer { sdp }) => break sdp,
-            Some(SignalMessage::IceCandidate { candidate, .. }) => {
-                let _ = session.add_ice_candidate(&candidate).await;
+        tokio::select! {
+            msg = peer.rx.recv() => {
+                match msg {
+                    Some(SignalMessage::Answer { sdp }) => break sdp,
+                    Some(SignalMessage::IceCandidate { candidate, .. }) => {
+                        let _ = session.add_ice_candidate(&candidate).await;
+                    }
+                    Some(SignalMessage::Bye) => return Err(anyhow!("Viewer sent Bye before answer")),
+                    None => return Err(anyhow!("Signaling channel closed before answer")),
+                    _ => {}
+                }
             }
-            Some(SignalMessage::Bye) => return Err(anyhow!("Viewer sent Bye before answer")),
-            None => return Err(anyhow!("Signaling channel closed before answer")),
-            _ => {}
+            _ = &mut answer_deadline => {
+                return Err(anyhow!(
+                    "Viewer did not send SDP answer within 15 s — \
+                     restarting signaling for a new invite code"
+                ));
+            }
         }
     };
 
