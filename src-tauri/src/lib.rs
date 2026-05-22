@@ -4,7 +4,10 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 
@@ -247,10 +250,17 @@ async fn start_host_session(
             emit_status(&app_clone, "connecting", None);
 
             // Status relay channel for WebRTC session.
+            // Also tracks whether the connection phase completed (reached
+            // "streaming") so the OS watchdog below doesn't fire mid-stream.
             let (status_tx, mut status_rx) = mpsc::channel::<String>(8);
             let app_status = app_clone.clone();
+            let streaming_reached = Arc::new(AtomicBool::new(false));
+            let streaming_for_relay = Arc::clone(&streaming_reached);
             tokio::spawn(async move {
                 while let Some(s) = status_rx.recv().await {
+                    if s == "streaming" {
+                        streaming_for_relay.store(true, Ordering::Release);
+                    }
                     emit_status(&app_status, &s, None);
                 }
             });
@@ -259,15 +269,43 @@ async fn start_host_session(
             let video_rx = video_tx.subscribe();
             let audio_rx = audio_tx.subscribe();
 
-            match webrtc_session::run_host_session(video_rx, audio_rx, peer, status_tx).await {
-                Ok(()) => {
-                    log::info!("Viewer disconnected normally — restarting signaling");
-                    // Loop: show new invite code for the next viewer.
+            // Spawn run_host_session as its own task so the OS watchdog can
+            // abort it if webrtc-rs blocks ALL Tokio threads before the inner
+            // Tokio-based timeouts (10 s init + 15 s answer + 30 s ICE) fire.
+            let host_task =
+                tokio::spawn(webrtc_session::run_host_session(video_rx, audio_rx, peer, status_tx));
+            let host_abort = host_task.abort_handle();
+            let app_wd2 = app_clone.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                // Only fire if we never reached the streaming phase.
+                if streaming_reached.load(Ordering::Acquire) {
+                    return;
                 }
-                Err(e) => {
+                log::warn!("Host session watchdog fired after 60 s — aborting stuck task");
+                host_abort.abort();
+                emit_error(
+                    &app_wd2,
+                    "Host connection timed out after 60 s — \
+                     restarting signaling for a fresh invite code.",
+                );
+            });
+
+            match host_task.await {
+                Ok(Ok(())) => {
+                    log::info!("Viewer disconnected normally — restarting signaling");
+                }
+                Ok(Err(e)) => {
                     log::warn!("Session failed ({e}) — restarting signaling");
                     emit_error(&app_clone, &e.to_string());
-                    // Loop: show new invite code so the user can retry.
+                }
+                Err(join_err) if join_err.is_cancelled() => {
+                    log::warn!("Host session aborted by watchdog — restarting signaling");
+                    // Watchdog already emitted the error; just restart.
+                }
+                Err(join_err) => {
+                    log::warn!("Host session task panicked: {join_err}");
+                    emit_error(&app_clone, &format!("Host session panicked: {join_err}"));
                 }
             }
         }
@@ -297,15 +335,54 @@ async fn join_viewer_session(
         .map_err(|e| format!("Cannot reach host: {e}"))?;
 
     let app2 = app.clone();
+    let app_wd = app.clone(); // watchdog owns its own AppHandle clone
+
+    // AtomicBool: viewer task sets this to `true` when it finishes (success or
+    // error). The OS-thread watchdog reads it before deciding whether to fire.
+    let done = Arc::new(AtomicBool::new(false));
+    let done_task = Arc::clone(&done);
+
     let handle = tokio::spawn(async move {
-        if let Err(e) = run_viewer_session(peer, app2.clone()).await {
+        let result = run_viewer_session(peer, app2.clone()).await;
+        // Mark done BEFORE emitting so the watchdog never double-fires.
+        done_task.store(true, Ordering::Release);
+        if let Err(e) = result {
             log::error!("Viewer session error: {e}");
             emit_error(&app2, &e.to_string());
             emit_status(&app2, "disconnected", None);
         }
     });
-    // Store the abort handle so stop_session() can cancel this task immediately.
-    *state.viewer_task.lock().await = Some(handle.abort_handle());
+
+    let abort_for_state = handle.abort_handle();
+    let abort_for_watchdog = abort_for_state.clone();
+    *state.viewer_task.lock().await = Some(abort_for_state);
+
+    // ── OS-thread watchdog ────────────────────────────────────────────────────
+    // webrtc-rs blocks Tokio worker threads with synchronous calls (DNS
+    // resolution for STUN, ICE socket setup, DTLS init). When ALL worker
+    // threads are blocked, tokio::time::timeout and tokio::pin! sleep futures
+    // sit in the run queue with no thread to execute on, so they never fire.
+    //
+    // std::thread::sleep is immune to this — it uses the OS scheduler directly.
+    // After 45 s, we abort the stuck task and surface a clear error so the
+    // user can retry (and see the Windows Firewall instructions if needed).
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(45));
+        if done.load(Ordering::Acquire) {
+            return; // task already finished normally — nothing to do
+        }
+        log::warn!("Viewer session watchdog fired after 45 s — aborting stuck task");
+        abort_for_watchdog.abort();
+        emit_error(
+            &app_wd,
+            "Connection timed out after 45 s. \
+             webrtc-rs is likely blocked on UDP socket setup or STUN DNS lookup. \
+             To fix same-machine testing, run once in an admin PowerShell: \
+             New-NetFirewallRule -DisplayName \"GameShare UDP\" \
+             -Direction Inbound -Protocol UDP -Action Allow",
+        );
+        emit_status(&app_wd, "disconnected", None);
+    });
 
     Ok(())
 }
@@ -395,31 +472,7 @@ pub fn run() {
 
 // ─── Viewer session orchestration ─────────────────────────────────────────────
 
-/// Outer wrapper — imposes a hard 45-second deadline on the entire viewer
-/// session (signaling + SDP exchange + ICE + streaming).
-///
-/// Why: webrtc-rs can stall inside internal async locks (ICE setup, DTLS
-/// handshake) before `wait_for_connection()`'s 30-second timer even starts.
-/// This outer timeout guarantees the task always terminates so the user can
-/// retry, regardless of where the hang occurs.
-async fn run_viewer_session(peer: signaling::SignalingPeer, app: AppHandle) -> Result<()> {
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(45),
-        run_viewer_session_inner(peer, app),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_elapsed) => Err(anyhow::anyhow!(
-            "Connection timed out after 45 s. \
-             If both peers are on the same machine, add a Windows Firewall rule \
-             that allows UDP for gameshare.exe. \
-             For internet play, make sure port forwarding or a TURN relay is configured."
-        )),
-    }
-}
-
-async fn run_viewer_session_inner(mut peer: signaling::SignalingPeer, app: AppHandle) -> Result<()> {
+async fn run_viewer_session(mut peer: signaling::SignalingPeer, app: AppHandle) -> Result<()> {
     // Wait for offer from host
     let offer_sdp = loop {
         match peer.rx.recv().await {
