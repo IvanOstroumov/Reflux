@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for the main GameShare window. Grants the core APIs the frontend uses — event.listen for session-status / rtp-video / rtp-audio events, window controls for the custom title bar, webview for devtools, and the shell plugin for opening URLs.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:webview:default",
+    "core:window:default",
+    "shell:default"
+  ]
+}
