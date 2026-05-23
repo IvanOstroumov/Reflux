@@ -199,24 +199,46 @@ pub async fn try_wgc(
         }
 
         let _ = ready_tx.send(Ok((w, h)));
+        log::info!("WGC capture started: {w}×{h} @ target {fps_limit} fps");
 
         // Frame loop — poll at fps_limit rate
         let frame_us = 1_000_000u64 / fps_limit.max(1) as u64;
         let mut next_frame_time = std::time::Instant::now();
         let mut last_stop_check = std::time::Instant::now();
+        let mut last_diag_log = std::time::Instant::now();
+        let mut poll_iters: u64 = 0;
+        let mut frames_got: u64 = 0;
+        let mut frames_sent: u64 = 0;
+        let mut send_failed: u64 = 0;
 
         // Staging texture for CPU readback
         let staging = create_staging_texture(&d3d_device, w, h)
             .expect("Failed to create staging texture");
 
+        let exit_reason: &str;
         loop {
             // Check stop signal every 16ms (break on explicit stop or sender dropped)
             if last_stop_check.elapsed().as_millis() > 16 {
                 match stop_rx.try_recv() {
-                    Ok(()) | Err(oneshot::error::TryRecvError::Closed) => break,
+                    Ok(()) => { exit_reason = "stop signaled"; break; }
+                    Err(oneshot::error::TryRecvError::Closed) => {
+                        exit_reason = "stop sender dropped (CaptureSession gone)";
+                        break;
+                    }
                     Err(oneshot::error::TryRecvError::Empty) => {}
                 }
                 last_stop_check = std::time::Instant::now();
+            }
+
+            // Periodic diagnostic — every 2 seconds report what the WGC loop
+            // is actually doing. If poll_iters keeps climbing but frames_got
+            // stays 0, TryGetNextFrame is the failure point.
+            if last_diag_log.elapsed().as_secs() >= 2 {
+                log::info!(
+                    "WGC loop: poll_iters={poll_iters} frames_got={frames_got} \
+                     frames_sent={frames_sent} send_failed={send_failed}"
+                );
+                last_diag_log = std::time::Instant::now();
             }
 
             // Rate limit
@@ -227,9 +249,11 @@ pub async fn try_wgc(
             next_frame_time = std::time::Instant::now()
                 + std::time::Duration::from_micros(frame_us);
 
+            poll_iters += 1;
+
             // Try to grab the next frame from pool
             let frame = match frame_pool.TryGetNextFrame() {
-                Ok(f) => f,
+                Ok(f) => { frames_got += 1; f }
                 Err(_) => continue, // no frame ready yet
             };
 
@@ -287,11 +311,24 @@ pub async fn try_wgc(
 
                 // Non-blocking send — drop frame if encoder backpressured.
                 // Exit if the receiver (encoder) has been dropped.
-                if frame_tx.try_send(vf).is_err() && frame_tx.is_closed() {
-                    break;
+                match frame_tx.try_send(vf) {
+                    Ok(()) => frames_sent += 1,
+                    Err(_) => {
+                        send_failed += 1;
+                        if frame_tx.is_closed() {
+                            exit_reason = "frame_tx closed (encoder receiver dropped)";
+                            // break out of unsafe; outer loop's break is below
+                            break;
+                        }
+                    }
                 }
             }
         }
+
+        log::warn!(
+            "WGC capture loop exited: reason={exit_reason} poll_iters={poll_iters} \
+             frames_got={frames_got} frames_sent={frames_sent} send_failed={send_failed}"
+        );
 
         // Cleanup
         let _ = session.Close();
