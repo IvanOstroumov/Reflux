@@ -257,16 +257,31 @@ impl ViewerSession {
             let receiver = t.receiver().await;
             let app_for_decoder = app.clone();
             tokio::spawn(async move {
-                let tracks = receiver.tracks().await;
-                let track = match tracks.into_iter().next() {
-                    Some(t) => t,
-                    None => {
-                        log::warn!("Receiver for {:?} has no tracks — skipping decoder", kind);
-                        return;
+                // webrtc-rs creates the TrackRemote lazily — only when the
+                // first RTP packet for the SSRC arrives. That hasn't happened
+                // yet (ICE isn't even connected). Poll the receiver until
+                // its track shows up, then start the decoder.
+                let track = {
+                    let mut attempts = 0u32;
+                    loop {
+                        let tracks = receiver.tracks().await;
+                        if let Some(t) = tracks.into_iter().next() {
+                            break t;
+                        }
+                        attempts += 1;
+                        if attempts >= 150 {
+                            log::warn!(
+                                "Receiver for {:?}: no track after 30 s — giving up. \
+                                 RTP for this transceiver's SSRC never arrived.",
+                                kind
+                            );
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     }
                 };
                 log::info!(
-                    "Decoder spawned for {:?}: ssrc={} id={}",
+                    "Track ready for {:?}: ssrc={} id={} — starting decoder",
                     kind, track.ssrc(), track.id()
                 );
                 match kind {
