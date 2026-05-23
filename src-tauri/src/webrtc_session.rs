@@ -216,6 +216,14 @@ impl ViewerSession {
         pc.on_track(Box::new(move |track, _receiver, _transceiver| {
             let app = app.clone();
             Box::pin(async move {
+                // Log every invocation BEFORE touching anything else — if this
+                // line never appears for video, on_track simply isn't firing
+                // (a demux problem). If it appears but "Remote track" doesn't,
+                // the codec lookup is the failure point.
+                log::info!(
+                    "on_track invoked: kind={:?} ssrc={} id={} stream_id={}",
+                    track.kind(), track.ssrc(), track.id(), track.stream_id()
+                );
                 let codec = track.codec(); // sync in 0.11 — no .await
                 let mime = codec.capability.mime_type.to_lowercase();
                 log::info!("Remote track: {mime}");
