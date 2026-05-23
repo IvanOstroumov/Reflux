@@ -519,6 +519,7 @@ async fn run_viewer_session(
     // Connection established — tell the watchdog to stand down before we settle
     // into the (potentially long-lived) streaming phase.
     connected.store(true, Ordering::Release);
+    log::info!("Viewer: emitting session-status=streaming to frontend");
     emit_status(&app, "streaming", None);
 
     while let Some(msg) = peer.rx.recv().await {

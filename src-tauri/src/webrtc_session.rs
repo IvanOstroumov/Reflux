@@ -246,6 +246,19 @@ impl ViewerSession {
         pc.set_remote_description(offer).await
             .map_err(|e| anyhow!("set_remote_description: {e}"))?;
 
+        // Sanity-check: confirm webrtc-rs actually created a transceiver for
+        // EACH m-section in the offer. If audio appears but video does not,
+        // that's why video on_track never fires.
+        let transceivers = pc.get_transceivers().await;
+        log::info!("Viewer: {} transceiver(s) after set_remote_description", transceivers.len());
+        for (i, t) in transceivers.iter().enumerate() {
+            let mid = t.mid().map(|m| m.to_string()).unwrap_or_else(|| "<none>".into());
+            log::info!(
+                "  transceiver[{i}]: kind={:?} mid={} direction={:?}",
+                t.kind(), mid, t.direction()
+            );
+        }
+
         // Generate answer
         let answer = pc.create_answer(None).await
             .map_err(|e| anyhow!("create_answer: {e}"))?;
