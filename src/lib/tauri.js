@@ -2,20 +2,26 @@
 // Wraps @tauri-apps/api so the UI can be developed in a regular browser
 // (with stubs) and runs for real inside the Tauri WebView.
 
-const IS_TAURI = typeof window !== 'undefined' && window.__TAURI_INTERNALS__ !== undefined
-
 let _invoke = null
 let _listen = null
 let _event = null
 
+// Check at call time, not module-load time, in case Tauri injects its
+// internals after the module has already evaluated.
+function isTauri() {
+  return typeof window !== 'undefined' && window.__TAURI_INTERNALS__ !== undefined
+}
+
 async function loadTauri() {
-  if (!IS_TAURI) return
   if (_invoke) return
+  if (!isTauri()) return
   const { invoke } = await import('@tauri-apps/api/core')
   const { listen, emit } = await import('@tauri-apps/api/event')
   _invoke = invoke
   _listen = listen
   _event = emit
+  // Surface, once, that the real Tauri bridge is now wired up.
+  console.info('[tauri] Real Tauri bridge loaded (invoke + listen available)')
 }
 
 export async function invoke(cmd, args = {}) {

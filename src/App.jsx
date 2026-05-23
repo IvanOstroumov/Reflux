@@ -75,30 +75,48 @@ export default function App() {
     const registered = []
 
     const setup = async () => {
+      console.info('[App] registering Tauri event listeners')
+
       // session-status: { status, invite_code? }
-      const u1 = await listen('session-status', ({ payload }) => {
+      const u1 = await listen('session-status', (event) => {
+        console.info('[session-status]', event?.payload)
+        const payload = event?.payload
+        if (!payload) return
         setStatus(payload.status)
         if (payload.invite_code) setInviteCode(payload.invite_code)
         if (payload.status === 'disconnected') teardownDecoder()
       })
 
       // session-error: { message }
-      const u2 = await listen('session-error', ({ payload }) => {
-        setError(payload.message)
+      const u2 = await listen('session-error', (event) => {
+        console.warn('[session-error]', event?.payload)
+        setError(event?.payload?.message)
       })
 
       // rtp-video: base64 H.264 Annex-B access unit (one frame, viewer only)
-      const u3 = await listen('rtp-video', ({ payload }) => {
+      let videoCount = 0
+      const u3 = await listen('rtp-video', (event) => {
+        videoCount++
+        if (videoCount === 1 || videoCount % 60 === 0) {
+          console.info(`[rtp-video] received frame #${videoCount}`)
+        }
         const vs = videoStreamRef.current
         if (!vs) return
-        vs.feed(base64ToUint8Array(payload))
+        vs.feed(base64ToUint8Array(event.payload))
         if (vs.error) setError(vs.error)
       })
 
       // rtp-audio: base64 Opus frame (viewer only)
-      const u4 = await listen('rtp-audio', ({ payload }) => {
-        audioStreamRef.current?.feed(base64ToUint8Array(payload))
+      let audioCount = 0
+      const u4 = await listen('rtp-audio', (event) => {
+        audioCount++
+        if (audioCount === 1 || audioCount % 250 === 0) {
+          console.info(`[rtp-audio] received packet #${audioCount}`)
+        }
+        audioStreamRef.current?.feed(base64ToUint8Array(event.payload))
       })
+
+      console.info('[App] Tauri event listeners registered', { u1, u2, u3, u4 })
 
       if (cancelled) {
         // Cleanup already ran (StrictMode double-mount) — immediately unlisten
