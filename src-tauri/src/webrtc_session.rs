@@ -213,28 +213,18 @@ impl ViewerSession {
 
         // Register track handler — called when remote tracks arrive.
         // In webrtc 0.11, on_track is a sync fn; codec() is also sync now.
+        // Keep on_track as a logging-only diagnostic. The actual decoder
+        // dispatch is done manually after set_remote_description below,
+        // because webrtc-rs's on_track does NOT fire for our H.264 video
+        // track in this version (it fires reliably for audio only).
         pc.on_track(Box::new(move |track, _receiver, _transceiver| {
-            let app = app.clone();
             Box::pin(async move {
-                // Log every invocation BEFORE touching anything else — if this
-                // line never appears for video, on_track simply isn't firing
-                // (a demux problem). If it appears but "Remote track" doesn't,
-                // the codec lookup is the failure point.
                 log::info!(
                     "on_track invoked: kind={:?} ssrc={} id={} stream_id={}",
                     track.kind(), track.ssrc(), track.id(), track.stream_id()
                 );
-                let codec = track.codec(); // sync in 0.11 — no .await
-                let mime = codec.capability.mime_type.to_lowercase();
-                log::info!("Remote track: {mime}");
-
-                if mime.contains("h264") {
-                    tokio::spawn(async move { decode_h264_track(track, app).await; });
-                } else if mime.contains("opus") {
-                    tokio::spawn(async move { decode_opus_track(track, app).await; });
-                }
             })
-        })); // sync — no .await
+        }));
 
         // Log the received offer so we can see what the host actually declared
         // (a=ssrc, a=extmap, m-line order — everything needed to diagnose demux).
@@ -246,17 +236,45 @@ impl ViewerSession {
         pc.set_remote_description(offer).await
             .map_err(|e| anyhow!("set_remote_description: {e}"))?;
 
-        // Sanity-check: confirm webrtc-rs actually created a transceiver for
-        // EACH m-section in the offer. If audio appears but video does not,
-        // that's why video on_track never fires.
+        // ── Manual track subscription ────────────────────────────────────────
+        // webrtc-rs's on_track callback is unreliable for video in this
+        // version: the receiver gets RTP (the host even sees RTCP RR for the
+        // video SSRC) but on_track never fires for kind=Video.
+        //
+        // Workaround: pull the TrackRemote directly from each transceiver's
+        // receiver and start the decoder ourselves. This is what on_track
+        // would do for us — we just do it explicitly.
         let transceivers = pc.get_transceivers().await;
         log::info!("Viewer: {} transceiver(s) after set_remote_description", transceivers.len());
         for (i, t) in transceivers.iter().enumerate() {
             let mid = t.mid().map(|m| m.to_string()).unwrap_or_else(|| "<none>".into());
+            let kind = t.kind();
             log::info!(
                 "  transceiver[{i}]: kind={:?} mid={} direction={:?}",
-                t.kind(), mid, t.direction()
+                kind, mid, t.direction()
             );
+
+            let receiver = t.receiver().await;
+            let app_for_decoder = app.clone();
+            tokio::spawn(async move {
+                let tracks = receiver.tracks().await;
+                let track = match tracks.into_iter().next() {
+                    Some(t) => t,
+                    None => {
+                        log::warn!("Receiver for {:?} has no tracks — skipping decoder", kind);
+                        return;
+                    }
+                };
+                log::info!(
+                    "Decoder spawned for {:?}: ssrc={} id={}",
+                    kind, track.ssrc(), track.id()
+                );
+                match kind {
+                    RTPCodecType::Video => decode_h264_track(track, app_for_decoder).await,
+                    RTPCodecType::Audio => decode_opus_track(track, app_for_decoder).await,
+                    _ => {}
+                }
+            });
         }
 
         // Generate answer
