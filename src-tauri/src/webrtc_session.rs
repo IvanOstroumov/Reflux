@@ -31,13 +31,9 @@ use webrtc::{
         RTCPeerConnection,
     },
     rtp::{codecs::h264::H264Packet, packetizer::Depacketizer},
-    rtp_transceiver::{
-        rtp_codec::{
-            RTCRtpCodecCapability, RTCRtpCodecParameters, RTCRtpHeaderExtensionCapability,
-            RTPCodecType,
-        },
-        // In webrtc 0.11 the direction enum lives in its own sub-module.
-        rtp_transceiver_direction::RTCRtpTransceiverDirection,
+    rtp_transceiver::rtp_codec::{
+        RTCRtpCodecCapability, RTCRtpCodecParameters, RTCRtpHeaderExtensionCapability,
+        RTPCodecType,
     },
     track::{
         track_local::{track_local_static_sample::TrackLocalStaticSample, TrackLocal},
@@ -117,6 +113,9 @@ impl HostSession {
 
         let local_desc = pc.local_description().await
             .ok_or_else(|| anyhow!("No local description after gathering"))?;
+
+        // Log the SDP so we can verify a=ssrc and a=extmap lines for video.
+        log::info!("Host offer SDP:\n{}", local_desc.sdp);
 
         Ok((HostSession { pc, video_track, audio_track, state_rx }, local_desc.sdp))
     }
@@ -229,6 +228,10 @@ impl ViewerSession {
             })
         })); // sync — no .await
 
+        // Log the received offer so we can see what the host actually declared
+        // (a=ssrc, a=extmap, m-line order — everything needed to diagnose demux).
+        log::info!("Viewer received offer SDP:\n{}", sdp);
+
         // Set remote offer
         let offer = RTCSessionDescription::offer(sdp)
             .map_err(|e| anyhow!("offer parse: {e}"))?;
@@ -250,6 +253,8 @@ impl ViewerSession {
 
         let local_desc = pc.local_description().await
             .ok_or_else(|| anyhow!("No local description"))?;
+
+        log::info!("Viewer answer SDP:\n{}", local_desc.sdp);
 
         Ok((ViewerSession { pc, state_rx }, local_desc.sdp))
     }
@@ -431,23 +436,14 @@ async fn create_peer_connection(
           .await.map_err(|e| anyhow!("add video track: {e}"))?;
         pc.add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal + Send + Sync>)
           .await.map_err(|e| anyhow!("add audio track: {e}"))?;
-    } else {
-        // Viewer needs recv-only transceivers so SDP negotiation works
-        pc.add_transceiver_from_kind(
-            RTPCodecType::Video,
-            Some(webrtc::rtp_transceiver::RTCRtpTransceiverInit {
-                direction: RTCRtpTransceiverDirection::Recvonly,
-                send_encodings: vec![],
-            }),
-        ).await.map_err(|e| anyhow!("add video transceiver: {e}"))?;
-        pc.add_transceiver_from_kind(
-            RTPCodecType::Audio,
-            Some(webrtc::rtp_transceiver::RTCRtpTransceiverInit {
-                direction: RTCRtpTransceiverDirection::Recvonly,
-                send_encodings: vec![],
-            }),
-        ).await.map_err(|e| anyhow!("add audio transceiver: {e}"))?;
     }
+    // Viewer side: deliberately do NOT pre-add recvonly transceivers. With
+    // manually-created transceivers the receivers don't pick up the host's
+    // declared SSRCs (audio worked by coincidence, video did not — webrtc-rs
+    // fell into its simulcast-probe path and dropped every video RTP packet).
+    // set_remote_description(offer) creates the recvonly transceivers from
+    // the offer's m-sections and binds the host's a=ssrc to each receiver,
+    // which is the documented answerer pattern in webrtc-rs.
 
     Ok((pc, video_track, audio_track))
 }
