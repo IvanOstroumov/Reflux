@@ -24,7 +24,7 @@ use windows::{
             },
             Dxgi::{
                 CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIOutput1,
-                IDXGISurface, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
+                DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
                 DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -37,8 +37,11 @@ use windows::{
                 DispatcherQueueOptions,
                 DQTAT_COM_STA,
                 DQTYPE_THREAD_DEDICATED,
-                // CreateDirect3D11DeviceFromDXGIDevice lives here in windows 0.58
-                Direct3D11::CreateDirect3D11DeviceFromDXGIDevice,
+                // CreateDirect3D11DeviceFromDXGIDevice lives here in windows 0.58.
+                // IDirect3DDxgiInterfaceAccess is the WinRT→Win32 bridge needed
+                // to extract the underlying ID3D11Texture2D from an
+                // IDirect3DSurface returned by Windows Graphics Capture.
+                Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess},
                 // IGraphicsCaptureItemInterop for HWND/HMONITOR → GraphicsCaptureItem
                 Graphics::Capture::IGraphicsCaptureItemInterop,
             },
@@ -265,13 +268,18 @@ pub async fn try_wgc(
                 Err(_) => continue,
             };
 
-            // Get the underlying DXGI surface, then the D3D11 texture
-            let dxgi_surface: IDXGISurface = match surface.cast() {
-                Ok(s) => s,
+            // WGC returns an IDirect3DSurface (WinRT). To get the underlying
+            // ID3D11Texture2D (Win32 COM) we must go through
+            // IDirect3DDxgiInterfaceAccess::GetInterface — IDirect3DSurface
+            // does NOT QueryInterface to IDXGISurface directly. The previous
+            // direct .cast() chain silently failed on every frame, which is
+            // why frames_sent stayed at 0 despite frames_got climbing into
+            // the thousands.
+            let access: IDirect3DDxgiInterfaceAccess = match surface.cast() {
+                Ok(a) => a,
                 Err(_) => continue,
             };
-
-            let src_texture: ID3D11Texture2D = match dxgi_surface.cast() {
+            let src_texture: ID3D11Texture2D = match unsafe { access.GetInterface() } {
                 Ok(t) => t,
                 Err(_) => continue,
             };
