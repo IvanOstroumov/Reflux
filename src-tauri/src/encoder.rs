@@ -160,7 +160,10 @@ mod mf_encoder {
     const GET_EVENT_NO_WAIT:  MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS =
         MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(1); // MF_EVENT_FLAG_NO_WAIT
     // HRESULT returned when the event queue is empty (no-wait mode).
-    const MF_E_NO_EVENTS_AVAILABLE: u32 = 0xC00D_36B1;
+    // The correct value per mferror.h is 0xC00D3E80 — the old value
+    // (0xC00D36B1) is actually MF_E_BUFFERTOOSMALL and never matched, so the
+    // benign "no more events" condition was propagated as a real encoder error.
+    const MF_E_NO_EVENTS_AVAILABLE: u32 = 0xC00D_3E80;
     // GetType() returns u32 in windows 0.58; MF_EVENT_TYPE.0 is i32 — cast to match.
     const EVT_NEED_INPUT:     u32 = METransformNeedInput.0    as u32; // 600
     const EVT_HAVE_OUTPUT:    u32 = METransformHaveOutput.0   as u32; // 601
